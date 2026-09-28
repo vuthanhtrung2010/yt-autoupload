@@ -20,12 +20,19 @@ from yt_autosub.models import Visibility, UploadResult, VideoUploadTask
 from yt_autosub.uploader import upload_video
 from yt_autosub.auth import test_session
 from yt_autosub.stream_manager import session_manager, VIEWPORT_WIDTH, VIEWPORT_HEIGHT
+from yt_autosub.queue_manager import UploadQueueManager
+
+queue_manager = UploadQueueManager.get_instance()
 
 app = FastAPI(
     title="YouTube Multi-Account Automation API",
     description="Backend API with WebSocket remote browser streaming, multi-tenancy, and video upload automation.",
     version="0.2.0",
 )
+
+@app.on_event("startup")
+async def on_startup():
+    queue_manager.start_workers()
 
 # Enable CORS for external frontends (Svelte, Next.js, React)
 app.add_middleware(
@@ -155,6 +162,53 @@ async def upload_video_endpoint(req: DirectUploadRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error_message)
     return result
+
+class QueueUploadRequest(BaseModel):
+    job_id: str
+    user_id: str
+    account_aliases: List[str]
+    video_path: str
+    title: str
+    description: str = ""
+    tags: List[str] = []
+    thumbnail_path: Optional[str] = None
+    visibility: str = "PRIVATE"
+    proxy: Optional[ProxyConfig] = None
+
+@app.post("/api/v1/queue/upload", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_api_key)])
+async def enqueue_upload(req: QueueUploadRequest):
+    """Enqueue an automated video upload job across multiple accounts."""
+    job = queue_manager.create_job(
+        job_id=req.job_id,
+        user_id=req.user_id,
+        account_aliases=req.account_aliases,
+        video_path=req.video_path,
+        title=req.title,
+        description=req.description,
+        tags=req.tags,
+        thumbnail_path=req.thumbnail_path,
+        visibility=req.visibility,
+        proxy=req.proxy,
+    )
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "total_channels": len(job.tasks)
+    }
+
+@app.get("/api/v1/queue/jobs/{job_id}", dependencies=[Depends(verify_api_key)])
+async def get_queue_job(job_id: str):
+    """Get the current progress and per-account upload status of a queued job."""
+    job = queue_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
+
+@app.get("/api/v1/queue/jobs", dependencies=[Depends(verify_api_key)])
+async def list_queue_jobs(user_id: Optional[str] = Query(None)):
+    """List queue jobs, optionally filtered by user_id."""
+    jobs = queue_manager.list_jobs(user_id=user_id)
+    return {"jobs": [j.to_dict() for j in jobs]}
 
 # --- WebSocket Streaming Endpoint ---
 
