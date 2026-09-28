@@ -5,22 +5,37 @@ from playwright.async_api import BrowserContext, Page
 from camoufox.async_api import AsyncCamoufox
 from loguru import logger
 
-from yt_autosub.config import get_profile_dir, get_session_path, ProxyConfig
+from yt_autosub.config import (
+    get_profile_dir,
+    get_session_path,
+    get_user_profile_dir,
+    get_user_session_path,
+    ProxyConfig,
+)
 
 async def launch_account_browser(
-    account_id: str,
+    account_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    account_alias: Optional[str] = None,
     headless: bool = False,
     proxy: Optional[ProxyConfig] = None,
     inject_cookies: bool = True,
     **kwargs: Any,
 ) -> BrowserContext:
     """
-    Launch a dedicated Camoufox browser instance for a specific account.
-    Uses a persistent profile directory to preserve browser fingerprints,
-    device tokens, and session data.
+    Launch a dedicated Camoufox browser instance.
+    Supports either (user_id, account_alias) for multi-tenancy or account_id.
     """
-    profile_dir = get_profile_dir(account_id)
-    session_file = get_session_path(account_id)
+    if user_id and account_alias:
+        profile_dir = get_user_profile_dir(user_id, account_alias)
+        session_file = get_user_session_path(user_id, account_alias)
+        log_label = f"{user_id}:{account_alias}"
+    elif account_id:
+        profile_dir = get_profile_dir(account_id)
+        session_file = get_session_path(account_id)
+        log_label = account_id
+    else:
+        raise ValueError("Must provide either account_id or (user_id and account_alias)")
 
     # Clean up stale Firefox lock files if any
     for lock_name in ("lock", ".parentlock"):
@@ -40,11 +55,11 @@ async def launch_account_browser(
 
     if proxy:
         launch_opts["proxy"] = proxy.to_playwright_proxy()
-        logger.info(f"[{account_id}] Routing through proxy: {proxy.server}")
+        logger.info(f"[{log_label}] Routing through proxy: {proxy.server}")
 
     launch_opts.update(kwargs)
 
-    logger.info(f"[{account_id}] Launching Camoufox (headless={headless}, profile={profile_dir})")
+    logger.info(f"[{log_label}] Launching Camoufox (headless={headless}, profile={profile_dir})")
     
     # AsyncCamoufox context manager starts playwright and yields the BrowserContext
     camoufox_cm = AsyncCamoufox(**launch_opts)
@@ -69,9 +84,9 @@ async def launch_account_browser(
                             cookie["sameSite"] = "Lax"
                         sanitized.append(cookie)
                     await context.add_cookies(sanitized)
-                    logger.info(f"[{account_id}] Injected {len(sanitized)} cookies from {session_file.name}")
+                    logger.info(f"[{log_label}] Injected {len(sanitized)} cookies from {session_file.name}")
         except Exception as e:
-            logger.warning(f"[{account_id}] Could not inject cookies from {session_file}: {e}")
+            logger.warning(f"[{log_label}] Could not inject cookies from {session_file}: {e}")
 
     return context
 

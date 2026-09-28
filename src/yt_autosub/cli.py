@@ -161,6 +161,19 @@ def upload_single(
         console.print(f"[bold red]✗ FAILED:[/bold red] {res.error_message}")
         raise typer.Exit(code=1)
 
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Bind host (default: 127.0.0.1)"),
+    port: int = typer.Option(8000, "--port", "-p", help="Bind port (default: 8000)"),
+    reload: bool = typer.Option(False, "--reload", help="Enable auto-reload for development"),
+):
+    """
+    Launch the FastAPI backend server with WebSocket browser streaming and REST APIs.
+    """
+    import uvicorn
+    console.print(f"[bold green]Starting YouTube Automation Server at http://{host}:{port}[/bold green]")
+    uvicorn.run("yt_autosub.server:app", host=host, port=port, reload=reload)
+
 def main():
     app()
 
