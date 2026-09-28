@@ -1,0 +1,25 @@
+[project]
+name = "yt-autosub"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "devtrung", email = "vuthanhtrungsuper@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "camoufox[geoip]>=0.5.6",
+    "loguru>=0.7.3",
+    "playwright>=1.62.0",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+yt-autosub = "yt_autosub:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
