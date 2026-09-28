@@ -1,0 +1,18 @@
+# YouTube Multi-Account Auto-Upload Manifest
+# Specify tasks for 15+ accounts with videos, titles, tags, and visibility.
+
+uploads:
+  - account_id: "acc1"
+    video_path: "data/test_video.mp4"
+    title: "Camoufox Automated Video 1"
+    description: "Automated video upload with Camoufox and uv on NixOS."
+    tags: ["automation", "camoufox", "playwright"]
+    visibility: "PRIVATE"
+
+  # - account_id: "acc2"
+  #   video_path: "/path/to/channel2_video.mp4"
+  #   title: "Channel 2 Daily Short"
+  #   description: "Check out today's short!"
+  #   tags: ["shorts", "trending"]
+  #   thumbnail_path: "/path/to/custom_thumb.png"
+  #   visibility: "UNLISTED"

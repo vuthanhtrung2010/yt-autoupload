@@ -101,10 +101,69 @@ def list_accounts():
             "✓ YES" if has_session else "✗ NO",
         )
 
-    console.print(table)
+@app.command()
+def upload(
+    manifest_path: str = typer.Option("manifest.example.yaml", "--manifest", "-m", help="Path to YAML or JSON upload manifest"),
+    concurrency: int = typer.Option(2, "--concurrency", "-c", help="Number of concurrent Camoufox browser instances"),
+    headful: bool = typer.Option(False, "--headful", help="Run with browser windows visible"),
+):
+    """
+    Run batch video uploads across accounts defined in the manifest file.
+    Uses bounded concurrency to manage memory and resources.
+    """
+    from yt_autosub.runner import load_manifest, run_batch_upload
+    try:
+        manifest = load_manifest(manifest_path)
+    except Exception as e:
+        console.print(f"[bold red]Failed to load manifest:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    asyncio.run(run_batch_upload(manifest=manifest, concurrency=concurrency, headless=not headful))
+
+@app.command()
+def upload_single(
+    account_id: str = typer.Argument(..., help="Account ID to upload with"),
+    video: str = typer.Option(..., "--video", "-v", help="Path to video file"),
+    title: str = typer.Option(..., "--title", "-t", help="Video title"),
+    description: str = typer.Option("", "--description", "-d", help="Video description"),
+    tags: str = typer.Option("", "--tags", help="Comma-separated tags"),
+    thumbnail: Optional[str] = typer.Option(None, "--thumbnail", help="Custom thumbnail image path"),
+    visibility: str = typer.Option("PRIVATE", "--visibility", help="Visibility: PRIVATE, UNLISTED, or PUBLIC"),
+    headful: bool = typer.Option(False, "--headful", help="Run with browser window visible"),
+    proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL"),
+):
+    """
+    Upload a single video for an account via command line arguments.
+    """
+    from yt_autosub.models import VideoUploadTask, Visibility
+    from yt_autosub.uploader import upload_video
+
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+    try:
+        task = VideoUploadTask(
+            account_id=account_id,
+            video_path=video,
+            title=title,
+            description=description,
+            tags=tag_list,
+            thumbnail_path=thumbnail,
+            visibility=Visibility(visibility.upper()),
+        )
+    except Exception as e:
+        console.print(f"[bold red]Validation error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
+    proxy_cfg = parse_proxy(proxy)
+    res = asyncio.run(upload_video(task=task, headless=not headful, proxy=proxy_cfg))
+    if res.success:
+        console.print(f"[bold green]✓ SUCCESS:[/bold green] Uploaded '{res.title}' -> {res.video_url or 'Published'}")
+    else:
+        console.print(f"[bold red]✗ FAILED:[/bold red] {res.error_message}")
+        raise typer.Exit(code=1)
 
 def main():
     app()
 
 if __name__ == "__main__":
     main()
+

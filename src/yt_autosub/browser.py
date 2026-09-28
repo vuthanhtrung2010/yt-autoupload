@@ -22,6 +22,15 @@ async def launch_account_browser(
     profile_dir = get_profile_dir(account_id)
     session_file = get_session_path(account_id)
 
+    # Clean up stale Firefox lock files if any
+    for lock_name in ("lock", ".parentlock"):
+        lock_file = profile_dir / lock_name
+        if lock_file.exists():
+            try:
+                lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     launch_opts: dict[str, Any] = {
         "persistent_context": True,
         "user_data_dir": str(profile_dir),
