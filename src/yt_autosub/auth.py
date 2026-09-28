@@ -21,21 +21,27 @@ async def check_is_logged_in(page) -> bool:
     if "accounts.google.com" in current_url or "servicelogin" in current_url:
         return False
         
-    # Check if we are in studio channel dashboard
+    # If URL contains /channel/, user is definitely authenticated inside Studio
+    if "studio.youtube.com/channel/" in current_url:
+        return True
+
+    # Check if we are in studio dashboard
     if "studio.youtube.com" in current_url:
         try:
-            # Common elements on YouTube Studio home
             selectors = [
                 "#avatar-btn",
                 "ytcp-app",
                 "ytcp-navigation-drawer",
                 "#channel-title",
                 "button[aria-label*='Create' i]",
+                "button[aria-label*='Tạo' i]",
+                "button:has-text('Tạo')",
+                "button:has-text('Create')",
                 "#create-icon"
             ]
             for sel in selectors:
                 loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
+                if await loc.count() > 0:
                     return True
         except Exception:
             pass
@@ -151,10 +157,17 @@ async def test_session(
 
     try:
         logger.info(f"[{account_id}] Testing session at {STUDIO_URL}...")
-        await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(3)
+        await page.goto(STUDIO_URL, wait_until="networkidle", timeout=60000)
+        
+        # Poll up to 10 seconds for web components to load
+        is_logged = False
+        for _ in range(10):
+            if await check_is_logged_in(page):
+                is_logged = True
+                break
+            await asyncio.sleep(1)
 
-        if await check_is_logged_in(page):
+        if is_logged:
             # Save any refreshed cookies back
             await context.storage_state(path=str(session_file))
             return True, f"Session active! Current URL: {page.url}"
