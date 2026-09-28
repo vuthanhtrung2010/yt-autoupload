@@ -61,3 +61,17 @@ View all configured accounts, profile directories, and session statuses:
 ```bash
 yt-autosub list-accounts
 ```
+
+---
+
+## Backend API & Remote Browser Streaming (Web SaaS)
+
+Run the backend FastAPI server to enable interactive WebSocket streaming, REST management, and multi-tenancy for your web frontend:
+
+```bash
+yt-autosub serve --host 127.0.0.1 --port 8000
+```
+
+- **Interactive API Documentation**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- **Detailed API & Frontend Guide**: See [docs/API.md](docs/API.md) for full request/response schemas, WebSocket streaming protocol, and ready-to-use Svelte & Next.js/React component code.
+
