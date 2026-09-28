@@ -50,7 +50,12 @@ in
 
   env.LD_LIBRARY_PATH = "${lib.makeLibraryPath libraries}";
 
+  scripts.yt-autosub.exec = ''
+    exec uv run yt-autosub "$@"
+  '';
+
   enterShell = ''
     export LD_LIBRARY_PATH="${lib.makeLibraryPath libraries}:$LD_LIBRARY_PATH"
+    export PATH="$PWD/.venv/bin:$PATH"
   '';
 }
