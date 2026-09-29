@@ -125,7 +125,28 @@ async def close_session(session_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     await session.close()
-    return {"message": "Session closed"}
+    session_manager.sessions.pop(session_id, None)
+    return {"message": "Session closed and profile purged"}
+
+@app.delete("/api/v1/channels/{account_alias}", dependencies=[Depends(verify_api_key)])
+async def delete_channel_endpoint(
+    account_alias: str,
+    user_id: str = Query(..., description="User ID"),
+):
+    """Delete channel profile folder and session data on disk."""
+    import shutil
+    from yt_autosub.config import sanitize_identifier
+    clean_user = sanitize_identifier(user_id)
+    clean_alias = sanitize_identifier(account_alias)
+    profile_dir = PROFILES_DIR / clean_user / clean_alias
+    session_file = SESSIONS_DIR / clean_user / f"{clean_alias}.json"
+
+    if profile_dir.exists():
+        shutil.rmtree(profile_dir, ignore_errors=True)
+    if session_file.exists():
+        session_file.unlink(missing_ok=True)
+
+    return {"message": f"Channel data for {clean_alias} deleted"}
 
 @app.get("/api/v1/channels", dependencies=[Depends(verify_api_key)])
 async def list_user_channels(user_id: str = Query(..., description="User ID")):

@@ -214,6 +214,22 @@ class StreamingAuthSession:
             self.context = None
             self.page = None
 
+        if not self.is_authenticated:
+            import shutil
+            from yt_autosub.config import PROFILES_DIR, SESSIONS_DIR, sanitize_identifier
+            clean_user = sanitize_identifier(self.user_id)
+            clean_alias = sanitize_identifier(self.account_alias)
+            profile_dir = PROFILES_DIR / clean_user / clean_alias
+            session_file = SESSIONS_DIR / clean_user / f"{clean_alias}.json"
+            try:
+                if profile_dir.exists():
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+                if session_file.exists():
+                    session_file.unlink(missing_ok=True)
+                logger.info(f"[{self.session_id}] Purged unauthenticated profile folder {profile_dir}")
+            except Exception as e:
+                logger.warning(f"[{self.session_id}] Could not purge profile dir: {e}")
+
 class SessionManager:
     """Registry for active interactive streaming sessions."""
     def __init__(self):
