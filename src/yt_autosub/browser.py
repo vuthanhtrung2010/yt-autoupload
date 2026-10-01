@@ -10,6 +10,7 @@ from yt_autosub.config import (
     get_session_path,
     get_user_profile_dir,
     get_user_session_path,
+    resolve_account_paths,
     ProxyConfig,
 )
 
@@ -24,18 +25,15 @@ async def launch_account_browser(
 ) -> BrowserContext:
     """
     Launch a dedicated Camoufox browser instance.
-    Supports either (user_id, account_alias) for multi-tenancy or account_id.
+    Resolves correct profile directory and session file using resolve_account_paths.
     """
-    if user_id and account_alias:
-        profile_dir = get_user_profile_dir(user_id, account_alias)
-        session_file = get_user_session_path(user_id, account_alias)
-        log_label = f"{user_id}:{account_alias}"
-    elif account_id:
-        profile_dir = get_profile_dir(account_id)
-        session_file = get_session_path(account_id)
-        log_label = account_id
-    else:
-        raise ValueError("Must provide either account_id or (user_id and account_alias)")
+    profile_dir, session_file, log_label = resolve_account_paths(
+        account_id=account_id,
+        user_id=user_id,
+        account_alias=account_alias,
+    )
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[{log_label}] Resolved profile={profile_dir.name}, session={session_file.name} (exists={session_file.exists()})")
 
     # Clean up stale Firefox lock files if any
     for lock_name in ("lock", ".parentlock"):

@@ -136,6 +136,8 @@ class UploadQueueManager:
                     pass
 
                 task = VideoUploadTask(
+                    user_id=job.user_id,
+                    account_alias=channel_task.account_alias,
                     account_id=get_channel_id(job.user_id, channel_task.account_alias),
                     video_path=job.video_path,
                     title=job.title,

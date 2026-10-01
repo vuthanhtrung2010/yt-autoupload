@@ -1,6 +1,6 @@
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 from pydantic import BaseModel, Field, field_validator
 
 class Visibility(str, Enum):
@@ -9,13 +9,25 @@ class Visibility(str, Enum):
     PUBLIC = "PUBLIC"
 
 class VideoUploadTask(BaseModel):
-    account_id: str = Field(..., description="Unique account ID matching data/profiles and data/sessions")
+    account_id: Optional[str] = Field(default=None, description="Unique account ID matching data/profiles and data/sessions")
+    user_id: Optional[str] = Field(default=None, description="User ID for multi-tenant isolation")
+    account_alias: Optional[str] = Field(default=None, description="Account identifier within tenant")
     video_path: str = Field(..., description="Path to video file (.mp4, .mov, etc.)")
     title: str = Field(..., description="Video title (up to 100 characters)")
     description: str = Field(default="", description="Video description text")
     tags: List[str] = Field(default_factory=list, description="List of search tags")
     thumbnail_path: Optional[str] = Field(default=None, description="Path to custom thumbnail image")
     visibility: Visibility = Field(default=Visibility.PRIVATE, description="Visibility: PRIVATE, UNLISTED, or PUBLIC")
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.account_id:
+            if self.user_id and self.account_alias:
+                from yt_autosub.config import get_channel_id
+                self.account_id = get_channel_id(self.user_id, self.account_alias)
+            elif self.account_alias:
+                self.account_id = self.account_alias
+            else:
+                self.account_id = "default"
 
     @field_validator("title")
     @classmethod

@@ -6,7 +6,7 @@ from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
 
-from yt_autosub.config import get_session_path, get_profile_dir, ProxyConfig
+from yt_autosub.config import get_session_path, get_profile_dir, resolve_account_paths, ProxyConfig
 from yt_autosub.browser import launch_account_browser, close_account_browser
 
 console = Console()
@@ -136,19 +136,27 @@ async def interactive_login(
         await close_account_browser(context)
 
 async def test_session(
-    account_id: str,
+    account_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    account_alias: Optional[str] = None,
     headless: bool = True,
     proxy: Optional[ProxyConfig] = None,
 ) -> Tuple[bool, str]:
     """
     Test whether a saved session is still valid by navigating to YouTube Studio headless.
     """
-    session_file = get_session_path(account_id)
+    profile_dir, session_file, log_label = resolve_account_paths(
+        account_id=account_id,
+        user_id=user_id,
+        account_alias=account_alias,
+    )
     if not session_file.exists():
         return False, f"No session file found at {session_file}. Run 'auth' first."
 
     context = await launch_account_browser(
         account_id=account_id,
+        user_id=user_id,
+        account_alias=account_alias,
         headless=headless,
         proxy=proxy,
         inject_cookies=True,
@@ -156,7 +164,7 @@ async def test_session(
     page = context.pages[0] if context.pages else await context.new_page()
 
     try:
-        logger.info(f"[{account_id}] Testing session at {STUDIO_URL}...")
+        logger.info(f"[{log_label}] Testing session at {STUDIO_URL}...")
         await page.goto(STUDIO_URL, wait_until="networkidle", timeout=60000)
         
         # Poll up to 10 seconds for web components to load

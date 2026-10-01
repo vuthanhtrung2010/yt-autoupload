@@ -163,12 +163,25 @@ async def list_user_channels(user_id: str = Query(..., description="User ID")):
                 "has_session": True,
                 "session_file": str(sess_file),
             })
+    # If no user-scoped sessions exist, check root sessions for developer / fallback convenience
+    if not channels and SESSIONS_DIR.exists():
+        for sess_file in SESSIONS_DIR.glob("*.json"):
+            alias = sess_file.stem
+            channels.append({
+                "user_id": user_id,
+                "account_alias": alias,
+                "channel_id": get_channel_id(user_id, alias),
+                "has_session": True,
+                "session_file": str(sess_file),
+            })
     return {"user_id": user_id, "channels": channels}
 
 @app.post("/api/v1/upload", dependencies=[Depends(verify_api_key)])
 async def upload_video_endpoint(req: DirectUploadRequest):
     """Trigger automated video upload for a user's authenticated channel."""
     task = VideoUploadTask(
+        user_id=req.user_id,
+        account_alias=req.account_alias,
         account_id=get_channel_id(req.user_id, req.account_alias),
         video_path=req.video_path,
         title=req.title,
@@ -178,7 +191,6 @@ async def upload_video_endpoint(req: DirectUploadRequest):
         visibility=req.visibility,
     )
 
-    # Note: upload_video can launch with user_id and account_alias directly
     result = await upload_video(task=task, headless=True, proxy=req.proxy)
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error_message)

@@ -4,7 +4,7 @@ from typing import Optional
 from loguru import logger
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
-from yt_autosub.config import LOGS_DIR, ProxyConfig
+from yt_autosub.config import LOGS_DIR, ProxyConfig, sanitize_identifier
 from yt_autosub.browser import launch_account_browser, close_account_browser
 from yt_autosub.models import VideoUploadTask, UploadResult
 from yt_autosub.auth import check_is_logged_in
@@ -82,11 +82,14 @@ async def upload_video(
     Perform complete browser automation to upload a video to YouTube Studio.
     Completely language-agnostic using stable element IDs and attributes.
     """
-    account_id = task.account_id
-    logger.info(f"[{account_id}] Starting upload: '{task.title}' -> {task.video_path}")
+    account_id = task.account_id or (f"{task.user_id}_{task.account_alias}" if task.user_id else task.account_alias) or "default"
+    log_label = f"{task.user_id}:{task.account_alias}" if (task.user_id and task.account_alias) else account_id
+    logger.info(f"[{log_label}] Starting upload: '{task.title}' -> {task.video_path}")
 
     context = await launch_account_browser(
-        account_id=account_id,
+        account_id=task.account_id,
+        user_id=task.user_id,
+        account_alias=task.account_alias,
         headless=headless,
         proxy=proxy,
         inject_cookies=True,
@@ -95,13 +98,13 @@ async def upload_video(
 
     try:
         # Navigate to Studio
-        logger.info(f"[{account_id}] Navigating to YouTube Studio...")
+        logger.info(f"[{log_label}] Navigating to YouTube Studio...")
         await page.goto(STUDIO_URL, wait_until="networkidle", timeout=60000)
         await asyncio.sleep(2)
 
         # Verify authentication
         if not await check_is_logged_in(page):
-            screenshot_path = LOGS_DIR / f"error_auth_{account_id}.png"
+            screenshot_path = LOGS_DIR / f"error_auth_{sanitize_identifier(account_id)}.png"
             await page.screenshot(path=str(screenshot_path))
             return UploadResult(
                 account_id=account_id,
@@ -114,7 +117,7 @@ async def upload_video(
         # Trigger Upload Dialog
         opened = await trigger_upload_dialog(page)
         if not opened:
-            screenshot_path = LOGS_DIR / f"error_trigger_{account_id}.png"
+            screenshot_path = LOGS_DIR / f"error_trigger_{sanitize_identifier(account_id)}.png"
             await page.screenshot(path=str(screenshot_path))
             return UploadResult(
                 account_id=account_id,
@@ -230,7 +233,7 @@ async def upload_video(
 
     except Exception as e:
         logger.exception(f"[{account_id}] Failed upload: {e}")
-        screenshot_path = LOGS_DIR / f"upload_error_{account_id}.png"
+        screenshot_path = LOGS_DIR / f"upload_error_{sanitize_identifier(account_id)}.png"
         try:
             await page.screenshot(path=str(screenshot_path))
             logger.info(f"Saved failure screenshot to {screenshot_path}")

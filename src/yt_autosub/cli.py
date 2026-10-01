@@ -72,32 +72,54 @@ def list_accounts():
     List all configured accounts, persistent profiles, and saved session cookies.
     """
     table = Table(title="Configured YouTube Accounts")
-    table.add_column("Account ID", style="cyan")
+    table.add_column("Account / Channel ID", style="cyan")
     table.add_column("Profile Dir", style="blue")
     table.add_column("Session File", style="magenta")
     table.add_column("Has Session?", style="green")
 
-    account_ids = set()
-    if PROFILES_DIR.exists():
-        for p in PROFILES_DIR.iterdir():
-            if p.is_dir():
-                account_ids.add(p.name)
+    found_entries = []
+
+    # 1. Flat root accounts
     if SESSIONS_DIR.exists():
         for s in SESSIONS_DIR.glob("*.json"):
-            account_ids.add(s.stem)
+            alias = s.stem
+            p_dir = PROFILES_DIR / alias
+            found_entries.append((alias, p_dir, s, True))
 
-    if not account_ids:
+    # 2. Multi-tenant accounts (user_id/alias)
+    if SESSIONS_DIR.exists():
+        for u_dir in SESSIONS_DIR.iterdir():
+            if u_dir.is_dir():
+                for s in u_dir.glob("*.json"):
+                    alias = s.stem
+                    label = f"{u_dir.name}:{alias}"
+                    p_dir = PROFILES_DIR / u_dir.name / alias
+                    found_entries.append((label, p_dir, s, True))
+
+    # 3. Profiles without sessions
+    if PROFILES_DIR.exists():
+        for p in PROFILES_DIR.iterdir():
+            if p.is_dir() and not any(entry[1] == p for entry in found_entries):
+                if any(child.is_dir() for child in p.iterdir()):
+                    for child in p.iterdir():
+                        if child.is_dir():
+                            label = f"{p.name}:{child.name}"
+                            s_file = SESSIONS_DIR / p.name / f"{child.name}.json"
+                            if not any(entry[0] == label for entry in found_entries):
+                                found_entries.append((label, child, s_file, s_file.exists()))
+                else:
+                    s_file = SESSIONS_DIR / f"{p.name}.json"
+                    found_entries.append((p.name, p, s_file, s_file.exists()))
+
+    if not found_entries:
         console.print("[yellow]No accounts found yet. Run 'yt-autosub auth <account_id>' to set one up.[/yellow]")
         return
 
-    for acc_id in sorted(account_ids):
-        p_dir = get_profile_dir(acc_id)
-        s_file = get_session_path(acc_id)
-        has_session = s_file.exists()
+    for label, p_dir, s_file, has_session in sorted(found_entries, key=lambda x: x[0]):
         table.add_row(
-            acc_id,
-            str(p_dir.name),
-            str(s_file.name if has_session else "-"),
+            label,
+            str(p_dir.relative_to(PROFILES_DIR.parent)),
+            str(s_file.relative_to(SESSIONS_DIR.parent) if has_session else "-"),
             "✓ YES" if has_session else "✗ NO",
         )
 
