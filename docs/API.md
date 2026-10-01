@@ -1,44 +1,168 @@
 # YouTube Automation API Documentation
 
-This document describes the REST endpoints, WebSocket streaming protocol, and frontend integration examples (Svelte & Next.js/React) for the **yt-autosub** backend service.
+This document describes the REST endpoints, background queue system, WebSocket streaming protocol, TypeScript interfaces, and frontend integration examples (Svelte & Next.js/React) for the **yt-autosub** backend service.
 
 ---
 
 ## 1. Overview & Setup
 
 - **Base URL**: `http://127.0.0.1:8000` (by default)
-- **Interactive Swagger Docs**: `http://127.0.0.1:8000/docs`
-- **ReDoc**: `http://127.0.0.1:8000/redoc`
+- **Interactive Swagger UI**: `http://127.0.0.1:8000/docs`
+- **ReDoc UI**: `http://127.0.0.1:8000/redoc`
 
 ### Starting the Server
 ```bash
 devenv shell
-yt-autosub serve --host 127.0.0.1 --port 8000
+yt-autosub serve --host 127.0.0.1 --port 8000 --reload
 ```
 
 ### Authentication & Security
-If `YT_AUTOSUB_API_KEY` is configured on the backend:
-- Pass the header in all REST calls: `X-API-Key: <your-key>`
-- Pass the token in WebSocket queries: `ws://127.0.0.1:8000/api/v1/auth/session/{id}/ws?token=<your-key>`
+If `YT_AUTOSUB_API_KEY` is configured in the environment:
+- **REST Endpoints**: Pass `X-API-Key: <your-key>` header (or `?token=<your-key>` query parameter).
+- **WebSocket Streaming**: Pass `?token=<your-key>` in the WebSocket connection URL:
+  `ws://127.0.0.1:8000/api/v1/auth/session/{id}/ws?token=<your-key>`
 
 ---
 
-## 2. Multi-Tenancy Resolution
+## 2. Multi-Tenancy & Path Resolution
 
-To allow multiple users to use common account aliases like `acc1` or `channel_1` without collision, each channel is uniquely scoped:
-- **`user_id`**: The unique identifier of the user in your database (e.g. `usr_89f02a`).
-- **`account_alias`**: The friendly channel label chosen by the user (e.g. `acc1`).
+To allow multiple SaaS users to connect accounts without collisions (e.g. multiple users having an account named `acc1`):
+- **`user_id`**: The unique identifier of the user in your database (e.g. `usr_89f02a`, `6AnkfOE3XqE87i8OxBfYYTywysLahTIi`).
+- **`account_alias`**: The friendly channel label chosen by the user (e.g. `acc1`, `tech_channel`).
 - **`channel_id`**: Automatically generated composite ID: `{user_id}_{account_alias}`.
 
-Storage on the server is physically isolated:
-- Profile: `data/profiles/{user_id}/{account_alias}/`
-- Session: `data/sessions/{user_id}/{account_alias}.json`
+### Storage Layout on Server
+- **Persistent Browser Profiles**: `data/profiles/{user_id}/{account_alias}/`
+- **Exported Cookie & Storage Sessions**: `data/sessions/{user_id}/{account_alias}.json`
+
+### Automatic Fallback Behavior
+The backend includes intelligent fallback resolution:
+1. It looks for user-scoped session data first: `data/sessions/{user_id}/{account_alias}.json`.
+2. If absent, it checks if a root session exists: `data/sessions/{account_alias}.json` (e.g., created during CLI debugging `yt-autosub auth acc1`).
+3. If an upload job passes a composite `account_id` (e.g. `6AnkfOE3XqE87i8OxBfYYTywysLahTIi_acc1`), the backend automatically decomposes it to locate the exact session.
 
 ---
 
-## 3. REST API Endpoints
+## 3. TypeScript Interfaces for Frontend
 
-### 3.1 Health Check
+You can copy-paste these types directly into your frontend codebase (`src/types/yt-autosub.ts`):
+
+```typescript
+export type Visibility = "PRIVATE" | "UNLISTED" | "PUBLIC";
+
+export interface ProxyConfig {
+  server: string; // e.g. "http://proxy.host:8080" or "socks5://ip:port"
+  username?: string;
+  password?: string;
+}
+
+// --- Auth & Session ---
+export interface CreateAuthSessionRequest {
+  user_id: string;
+  account_alias: string;
+  proxy?: ProxyConfig | null;
+}
+
+export interface AuthSessionResponse {
+  session_id: string;
+  channel_id: string;
+  user_id: string;
+  account_alias: string;
+  status: "starting" | "active" | "authenticated" | "closed" | "error";
+  ws_endpoint: string;
+  embed_url: string;
+}
+
+export interface AuthSessionStatusResponse {
+  session_id: string;
+  channel_id: string;
+  status: "starting" | "active" | "authenticated" | "closed" | "error";
+  is_authenticated: boolean;
+  channel_url?: string | null;
+  error?: string | null;
+}
+
+// --- Channels ---
+export interface ChannelItem {
+  user_id: string;
+  account_alias: string;
+  channel_id: string;
+  has_session: boolean;
+  session_file: string;
+}
+
+export interface ListChannelsResponse {
+  user_id: string;
+  channels: ChannelItem[];
+}
+
+// --- Direct Upload ---
+export interface DirectUploadRequest {
+  user_id: string;
+  account_alias: string;
+  video_path: string;
+  title: string;
+  description?: string;
+  tags?: string[];
+  thumbnail_path?: string | null;
+  visibility?: Visibility;
+  proxy?: ProxyConfig | null;
+}
+
+export interface UploadResult {
+  account_id: string;
+  video_path: string;
+  title: string;
+  success: boolean;
+  video_url?: string | null;
+  error_message?: string | null;
+}
+
+// --- Queue Upload ---
+export interface QueueUploadRequest {
+  job_id: string;
+  user_id: string;
+  account_aliases: string[]; // e.g. ["acc1", "acc2"]
+  video_path: string;
+  title: string;
+  description?: string;
+  tags?: string[];
+  thumbnail_path?: string | null;
+  visibility?: Visibility;
+  proxy?: ProxyConfig | null;
+}
+
+export interface QueueUploadResponse {
+  job_id: string;
+  status: "queued" | "processing" | "completed" | "partial_failed" | "failed";
+  total_channels: number;
+}
+
+export interface QueueChannelTask {
+  account_alias: string;
+  status: "queued" | "uploading" | "completed" | "failed";
+  video_url?: string | null;
+  error_message?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface QueueJobStatus {
+  job_id: string;
+  user_id: string;
+  status: "queued" | "processing" | "completed" | "partial_failed" | "failed";
+  title: string;
+  created_at: string;
+  updated_at: string;
+  tasks: QueueChannelTask[];
+}
+```
+
+---
+
+## 4. REST API Reference
+
+### 4.1 Health Check
 Verify backend server status.
 
 ```http
@@ -55,7 +179,7 @@ GET /api/v1/health
 
 ---
 
-### 3.2 Create Channel Authentication Session
+### 4.2 Start Browser Auth Session
 Spins up an isolated Camoufox instance in the background navigating to YouTube Studio. Returns the streaming URL.
 
 ```http
@@ -69,7 +193,7 @@ Content-Type: application/json
   "user_id": "usr_10293",
   "account_alias": "tech_vlog",
   "proxy": {
-    "server": "http://user:pass@residential-proxy.net:8080",
+    "server": "http://residential-proxy.net:8080",
     "username": "optional_user",
     "password": "optional_password"
   }
@@ -92,7 +216,7 @@ Content-Type: application/json
 
 ---
 
-### 3.3 Get Session Status
+### 4.3 Get Session Status
 Check if a user has completed login or if the session is still active.
 
 ```http
@@ -111,7 +235,7 @@ GET /api/v1/auth/session/{session_id}
 }
 ```
 
-Status values:
+*Status values:*
 - `"starting"`: Browser initializing and navigating to Google/YouTube.
 - `"active"`: Browser ready; user can interact and log in.
 - `"authenticated"`: User successfully completed login & 2FA; cookies exported.
@@ -120,7 +244,7 @@ Status values:
 
 ---
 
-### 3.4 Terminate / Close Session
+### 4.4 Terminate / Close Session
 Manually close the remote browser instance if the user cancels or closes the modal.
 
 ```http
@@ -130,13 +254,13 @@ DELETE /api/v1/auth/session/{session_id}
 **Response (200 OK):**
 ```json
 {
-  "message": "Session closed"
+  "message": "Session closed and profile purged"
 }
 ```
 
 ---
 
-### 3.5 List User's Connected Channels
+### 4.5 List User's Connected Channels
 Returns all channels that have active sessions for a given user.
 
 ```http
@@ -161,8 +285,24 @@ GET /api/v1/channels?user_id=usr_10293
 
 ---
 
-### 3.6 Trigger Video Upload
-Uploads a video to YouTube using the authenticated channel's profile and session.
+### 4.6 Delete Connected Channel
+Purges the persistent profile directory and saved session cookies for a user's channel.
+
+```http
+DELETE /api/v1/channels/{account_alias}?user_id=usr_10293
+```
+
+**Response (200 OK):**
+```json
+{
+  "message": "Channel data for tech_vlog deleted"
+}
+```
+
+---
+
+### 4.7 Direct Synchronous Upload
+Uploads a video to YouTube using the authenticated channel's profile and session. Blocks until upload finishes or fails.
 
 ```http
 POST /api/v1/upload
@@ -174,40 +314,150 @@ Content-Type: application/json
 {
   "user_id": "usr_10293",
   "account_alias": "tech_vlog",
-  "video_path": "/path/to/server_video.mp4",
+  "video_path": "data/test_video.mp4",
   "title": "My Awesome Video Title",
   "description": "Video description here...\nLinks & info.",
   "tags": ["tech", "vlog", "coding"],
-  "thumbnail_path": "/path/to/custom_thumb.jpg",
+  "thumbnail_path": null,
   "visibility": "PRIVATE",
-  "proxy": {
-    "server": "http://proxy.host:8080"
-  }
+  "proxy": null
 }
 ```
 
-*Visibility options:* `"PRIVATE"`, `"UNLISTED"`, or `"PUBLIC"`.
+*Field details:*
+- `user_id` (string, required): The tenant / user ID.
+- `account_alias` (string, required): The channel alias (must have an active session).
+- `video_path` (string, required): Absolute or project-relative path to video file on server.
+- `title` (string, required): Up to 100 characters.
+- `description` (string, optional): Default `""`.
+- `tags` (string array, optional): Default `[]`.
+- `thumbnail_path` (string, optional): Path to custom thumbnail on server.
+- `visibility` (string, optional): `"PRIVATE"`, `"UNLISTED"`, or `"PUBLIC"` (default: `"PRIVATE"`).
+- `proxy` (object, optional): Proxy override for upload.
 
 **Response (200 OK):**
 ```json
 {
   "account_id": "usr_10293_tech_vlog",
-  "video_path": "/path/to/server_video.mp4",
+  "video_path": "/home/devtrung/Projects/yt-autosub/data/test_video.mp4",
   "title": "My Awesome Video Title",
   "success": true,
-  "video_url": "https://youtu.be/w6ZVpSnFiKo",
+  "video_url": "https://youtu.be/Yv6fTZyh8BQ",
   "error_message": null
 }
 ```
 
 ---
 
-## 4. WebSocket Browser Streaming Protocol
+### 4.8 Background Queue Upload (Async Batch)
+Enqueues an automated upload job that runs asynchronously across one or multiple accounts with built-in concurrency management.
+
+```http
+POST /api/v1/queue/upload
+Content-Type: application/json
+```
+
+**Request Body:**
+```json
+{
+  "job_id": "job_2026_09_001",
+  "user_id": "usr_10293",
+  "account_aliases": ["tech_vlog", "gaming_channel"],
+  "video_path": "data/test_video.mp4",
+  "title": "Synced Multi-Channel Broadcast",
+  "description": "Broadcast description",
+  "tags": ["broadcast", "sync"],
+  "thumbnail_path": null,
+  "visibility": "PRIVATE",
+  "proxy": null
+}
+```
+
+**Response (202 Accepted):**
+```json
+{
+  "job_id": "job_2026_09_001",
+  "status": "queued",
+  "total_channels": 2
+}
+```
+
+---
+
+### 4.9 Get Queue Job Status
+Poll the progress of an asynchronous upload job across its assigned channels.
+
+```http
+GET /api/v1/queue/jobs/{job_id}
+```
+
+**Response (200 OK):**
+```json
+{
+  "job_id": "job_2026_09_001",
+  "user_id": "usr_10293",
+  "status": "processing",
+  "title": "Synced Multi-Channel Broadcast",
+  "created_at": "2026-09-29T11:00:23.880Z",
+  "updated_at": "2026-09-29T11:01:05.120Z",
+  "tasks": [
+    {
+      "account_alias": "tech_vlog",
+      "status": "completed",
+      "video_url": "https://youtu.be/w6ZVpSnFiKo",
+      "error_message": null,
+      "started_at": "2026-09-29T11:00:24.000Z",
+      "completed_at": "2026-09-29T11:00:58.000Z"
+    },
+    {
+      "account_alias": "gaming_channel",
+      "status": "uploading",
+      "video_url": null,
+      "error_message": null,
+      "started_at": "2026-09-29T11:00:59.000Z",
+      "completed_at": null
+    }
+  ]
+}
+```
+
+*Job Status Values:* `"queued"`, `"processing"`, `"completed"`, `"partial_failed"`, `"failed"`.  
+*Task Status Values:* `"queued"`, `"uploading"`, `"completed"`, `"failed"`.
+
+---
+
+### 4.10 List Queue Jobs
+List recent queue jobs, optionally filtered by user ID.
+
+```http
+GET /api/v1/queue/jobs?user_id=usr_10293
+```
+
+**Response (200 OK):**
+```json
+{
+  "jobs": [
+    {
+      "job_id": "job_2026_09_001",
+      "user_id": "usr_10293",
+      "status": "completed",
+      "title": "Synced Multi-Channel Broadcast",
+      "created_at": "2026-09-29T11:00:23.880Z",
+      "updated_at": "2026-09-29T11:01:45.000Z",
+      "tasks": [...]
+    }
+  ]
+}
+```
+
+---
+
+## 5. WebSocket Browser Streaming Protocol
 
 - **URL**: `ws://{host}:{port}/api/v1/auth/session/{session_id}/ws`
 - *(Optional token)*: `ws://{host}:{port}/api/v1/auth/session/{session_id}/ws?token={API_KEY}`
 
-### 4.1 Server $\to$ Client Messages
+### 5.1 Server $\to$ Client Messages
 
 #### Video Frame (Broadcast ~10fps + immediately on action)
 ```json
@@ -233,7 +483,7 @@ Emitted immediately when YouTube Studio dashboard is detected:
 
 ---
 
-### 4.2 Client $\to$ Server Messages
+### 5.2 Client $\to$ Server Messages
 
 Send coordinates normalized from `0.0` to `1.0` (independent of canvas display size).
 
@@ -247,7 +497,7 @@ Send coordinates normalized from `0.0` to `1.0` (independent of canvas display s
   "button": "left"
 }
 ```
-*Actions:* `"click"`, `"move"`, `"down"`, `"up"`.
+*Actions:* `"click"`, `"move"`, `"down"`, `"up"`.  
 *Buttons:* `"left"`, `"right"`, `"middle"`.
 
 #### Typing Characters
@@ -279,7 +529,7 @@ Send coordinates normalized from `0.0` to `1.0` (independent of canvas display s
 
 ---
 
-## 5. Frontend Integration Examples
+## 6. Frontend Integration Examples
 
 ### Option A: Direct `<iframe>` Embed (Zero frontend code)
 If you don't want to build a custom canvas client, embed the built-in streamer directly in your modal:
