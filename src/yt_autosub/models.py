@@ -1,7 +1,45 @@
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Tuple
 from pydantic import BaseModel, Field, field_validator
+
+def parse_schedule_datetime(val: str) -> Tuple[str, str]:
+    """
+    Parse a datetime string into (date_str, time_str) for YouTube Studio.
+    date_str is formatted as 'DD/MM/YYYY'.
+    time_str is formatted as 'HH:MM'.
+    """
+    clean = val.strip()
+    dt = None
+    try:
+        dt = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    if dt is None:
+        formats = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d-%m-%Y %H:%M:%S",
+            "%d-%m-%Y %H:%M",
+            "%m/%d/%Y %H:%M",
+        ]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(clean, fmt)
+                break
+            except Exception:
+                continue
+    if dt is None:
+        raise ValueError(
+            f"Could not parse scheduled datetime '{val}'. Expected ISO 8601 (e.g. '2026-10-25T18:00:00') "
+            f"or format like 'YYYY-MM-DD HH:MM'."
+        )
+    return dt.strftime("%d/%m/%Y"), dt.strftime("%H:%M")
 
 class Visibility(str, Enum):
     PRIVATE = "PRIVATE"
@@ -18,6 +56,14 @@ class VideoUploadTask(BaseModel):
     tags: List[str] = Field(default_factory=list, description="List of search tags")
     thumbnail_path: Optional[str] = Field(default=None, description="Path to custom thumbnail image")
     visibility: Visibility = Field(default=Visibility.PRIVATE, description="Visibility: PRIVATE, UNLISTED, or PUBLIC")
+    scheduled_publish_time: Optional[str] = Field(
+        default=None,
+        description="ISO 8601 or standard datetime string (e.g. '2026-10-25T18:00:00' or '2026-10-25 18:00') to schedule video release"
+    )
+    set_as_premiere: bool = Field(
+        default=False,
+        description="Whether to set the scheduled video as a Premiere (Công chiếu)"
+    )
 
     def model_post_init(self, __context: Any) -> None:
         if not self.account_id:
@@ -52,6 +98,14 @@ class VideoUploadTask(BaseModel):
             if not path.exists():
                 raise ValueError(f"Thumbnail file not found: {v}")
             return str(path)
+        return None
+
+    @field_validator("scheduled_publish_time")
+    @classmethod
+    def validate_scheduled_publish_time(cls, v: Optional[str]) -> Optional[str]:
+        if v:
+            parse_schedule_datetime(v)
+            return v.strip()
         return None
 
 class UploadManifest(BaseModel):

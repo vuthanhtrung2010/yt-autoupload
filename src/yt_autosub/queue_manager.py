@@ -29,7 +29,9 @@ class QueueJob:
     tags: List[str]
     thumbnail_path: Optional[str]
     visibility: str
-    proxy: Optional[ProxyConfig]
+    scheduled_publish_time: Optional[str] = None
+    set_as_premiere: bool = False
+    proxy: Optional[ProxyConfig] = None
     status: str = "queued" # queued, processing, completed, partial_failed, failed
     tasks: List[QueueChannelTask] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
@@ -41,6 +43,9 @@ class QueueJob:
             "user_id": self.user_id,
             "status": self.status,
             "title": self.title,
+            "visibility": self.visibility,
+            "scheduled_publish_time": self.scheduled_publish_time,
+            "set_as_premiere": self.set_as_premiere,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "tasks": [
@@ -91,6 +96,8 @@ class UploadQueueManager:
         tags: Optional[List[str]] = None,
         thumbnail_path: Optional[str] = None,
         visibility: str = "PRIVATE",
+        scheduled_publish_time: Optional[str] = None,
+        set_as_premiere: bool = False,
         proxy: Optional[ProxyConfig] = None,
     ) -> QueueJob:
         tasks = [QueueChannelTask(account_alias=alias) for alias in account_aliases]
@@ -103,6 +110,8 @@ class UploadQueueManager:
             tags=tags or [],
             thumbnail_path=thumbnail_path,
             visibility=visibility,
+            scheduled_publish_time=scheduled_publish_time,
+            set_as_premiere=set_as_premiere,
             proxy=proxy,
             tasks=tasks,
         )
@@ -145,6 +154,8 @@ class UploadQueueManager:
                     tags=job.tags,
                     thumbnail_path=job.thumbnail_path,
                     visibility=vis,
+                    scheduled_publish_time=job.scheduled_publish_time,
+                    set_as_premiere=job.set_as_premiere,
                 )
 
                 try:

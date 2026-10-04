@@ -99,7 +99,7 @@ async def upload_video(
     try:
         # Navigate to Studio
         logger.info(f"[{log_label}] Navigating to YouTube Studio...")
-        await page.goto(STUDIO_URL, wait_until="networkidle", timeout=60000)
+        await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(2)
 
         # Verify authentication
@@ -193,12 +193,64 @@ async def upload_video(
             await asyncio.sleep(1.5)
             await dismiss_popovers(page)
 
-        # Visibility Selection (Language-independent: name="PUBLIC", "UNLISTED", "PRIVATE")
-        logger.info(f"[{account_id}] Setting visibility to {task.visibility.value}...")
-        vis_radio = page.locator(f"[name='{task.visibility.value}']").first
-        await vis_radio.wait_for(state="visible", timeout=15000)
-        await vis_radio.scroll_into_view_if_needed()
-        await vis_radio.click()
+        # Visibility or Schedule Configuration
+        if task.scheduled_publish_time:
+            from yt_autosub.models import parse_schedule_datetime
+            target_date, target_time = parse_schedule_datetime(task.scheduled_publish_time)
+            logger.info(f"[{account_id}] Scheduling video release for {target_date} at {target_time} (premiere={task.set_as_premiere})...")
+
+            # 1. Expand Native YouTube Studio Schedule card
+            sched_card = page.locator("#second-container, [id*='schedule-toggle']").first
+            await sched_card.wait_for(state="visible", timeout=15000)
+            await sched_card.scroll_into_view_if_needed()
+            await sched_card.click()
+            await asyncio.sleep(1.5)
+
+            # 2. Open datepicker dialog
+            dp_trigger = page.locator("#datepicker-trigger").first
+            await dp_trigger.wait_for(state="visible", timeout=15000)
+            await dp_trigger.scroll_into_view_if_needed()
+            await dp_trigger.click()
+            await asyncio.sleep(1)
+
+            # 3. Fill Date into ytcp-date-picker input
+            dp_input = page.locator("ytcp-date-picker input").first
+            await dp_input.wait_for(state="visible", timeout=10000)
+            await dp_input.click(force=True)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(target_date)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(1)
+
+            # 4. Fill Time into timepicker input
+            tp_input = page.locator("ytcp-datetime-picker tp-yt-paper-input input, ytcp-time-of-day-picker input").first
+            await tp_input.wait_for(state="visible", timeout=10000)
+            await tp_input.click(force=True)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(target_time)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(1)
+
+            # 5. Handle Premiere checkbox if requested
+            if task.set_as_premiere:
+                logger.info(f"[{account_id}] Enabling Premiere for scheduled release...")
+                prem_checkbox = page.locator("#schedule-type-checkbox, ytcp-checkbox-lit#schedule-type-checkbox").first
+                if await prem_checkbox.count() > 0:
+                    aria_checked = await prem_checkbox.locator("#checkbox").first.get_attribute("aria-checked")
+                    if aria_checked != "true":
+                        await prem_checkbox.click()
+                        await asyncio.sleep(0.5)
+
+            logger.info(f"[{account_id}] Release schedule successfully set to {target_date} {target_time}")
+        else:
+            # Instant Visibility Selection (Language-independent: name="PUBLIC", "UNLISTED", "PRIVATE")
+            logger.info(f"[{account_id}] Setting visibility to {task.visibility.value}...")
+            vis_radio = page.locator(f"[name='{task.visibility.value}']").first
+            await vis_radio.wait_for(state="visible", timeout=15000)
+            await vis_radio.scroll_into_view_if_needed()
+            await vis_radio.click()
 
         # Capture Video Link if present
         video_url = None

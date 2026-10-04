@@ -97,6 +97,24 @@ yt-autosub upload-single acc1 \
 
 *(Visibility options: `PRIVATE`, `UNLISTED`, or `PUBLIC`).*
 
+#### Schedule a Release Date & Time (Native YouTube Studio Schedule)
+To set a specific future release date and time natively in YouTube Studio (and optionally premiere it):
+
+```bash
+# Schedule release for a specific date and time:
+yt-autosub upload-single acc1 \
+  --video data/test_video.mp4 \
+  --title "Scheduled Release" \
+  --schedule "2026-10-25 18:00"
+
+# Schedule release as a Premiere (Công chiếu):
+yt-autosub upload-single acc1 \
+  --video data/test_video.mp4 \
+  --title "Premiere Release" \
+  --schedule "2026-10-25 18:00" \
+  --premiere
+```
+
 ### 4. Batch Uploads via Manifest (`upload`)
 Run scheduled or concurrent uploads across multiple accounts using a manifest YAML/JSON:
 

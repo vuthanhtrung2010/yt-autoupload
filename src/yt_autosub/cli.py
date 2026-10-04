@@ -151,6 +151,8 @@ def upload_single(
     tags: str = typer.Option("", "--tags", help="Comma-separated tags"),
     thumbnail: Optional[str] = typer.Option(None, "--thumbnail", help="Custom thumbnail image path"),
     visibility: str = typer.Option("PRIVATE", "--visibility", help="Visibility: PRIVATE, UNLISTED, or PUBLIC"),
+    schedule: Optional[str] = typer.Option(None, "--schedule", "-s", help="Scheduled release datetime (e.g. '2026-10-25 18:00' or ISO 8601)"),
+    premiere: bool = typer.Option(False, "--premiere", help="Set scheduled release as Premiere (Công chiếu)"),
     headful: bool = typer.Option(False, "--headful", help="Run with browser window visible"),
     proxy: Optional[str] = typer.Option(None, "--proxy", "-p", help="Proxy URL"),
 ):
@@ -170,6 +172,8 @@ def upload_single(
             tags=tag_list,
             thumbnail_path=thumbnail,
             visibility=Visibility(visibility.upper()),
+            scheduled_publish_time=schedule,
+            set_as_premiere=premiere,
         )
     except Exception as e:
         console.print(f"[bold red]Validation error:[/bold red] {e}")

@@ -106,6 +106,8 @@ export interface DirectUploadRequest {
   tags?: string[];
   thumbnail_path?: string | null;
   visibility?: Visibility;
+  scheduled_publish_time?: string | null; // e.g. "2026-10-25T18:00:00" or "2026-10-25 18:00"
+  set_as_premiere?: boolean; // Set as Premiere (Công chiếu)
   proxy?: ProxyConfig | null;
 }
 
@@ -129,6 +131,8 @@ export interface QueueUploadRequest {
   tags?: string[];
   thumbnail_path?: string | null;
   visibility?: Visibility;
+  scheduled_publish_time?: string | null; // e.g. "2026-10-25T18:00:00" or "2026-10-25 18:00"
+  set_as_premiere?: boolean; // Set as Premiere (Công chiếu)
   proxy?: ProxyConfig | null;
 }
 
@@ -152,6 +156,9 @@ export interface QueueJobStatus {
   user_id: string;
   status: "queued" | "processing" | "completed" | "partial_failed" | "failed";
   title: string;
+  visibility?: Visibility;
+  scheduled_publish_time?: string | null;
+  set_as_premiere?: boolean;
   created_at: string;
   updated_at: string;
   tasks: QueueChannelTask[];
@@ -320,6 +327,8 @@ Content-Type: application/json
   "tags": ["tech", "vlog", "coding"],
   "thumbnail_path": null,
   "visibility": "PRIVATE",
+  "scheduled_publish_time": "2026-10-25 18:00",
+  "set_as_premiere": false,
   "proxy": null
 }
 ```
@@ -332,7 +341,9 @@ Content-Type: application/json
 - `description` (string, optional): Default `""`.
 - `tags` (string array, optional): Default `[]`.
 - `thumbnail_path` (string, optional): Path to custom thumbnail on server.
-- `visibility` (string, optional): `"PRIVATE"`, `"UNLISTED"`, or `"PUBLIC"` (default: `"PRIVATE"`).
+- `visibility` (string, optional): `"PRIVATE"`, `"UNLISTED"`, or `"PUBLIC"` (default: `"PRIVATE"`). Ignored if `scheduled_publish_time` is set.
+- `scheduled_publish_time` (string, optional): ISO 8601 or datetime string (e.g. `"2026-10-25 18:00"`) to schedule native release in YouTube Studio.
+- `set_as_premiere` (boolean, optional): Set to `true` to release the scheduled video as a Premiere (Công chiếu). Default `false`.
 - `proxy` (object, optional): Proxy override for upload.
 
 **Response (200 OK):**
@@ -369,6 +380,8 @@ Content-Type: application/json
   "tags": ["broadcast", "sync"],
   "thumbnail_path": null,
   "visibility": "PRIVATE",
+  "scheduled_publish_time": "2026-10-25 18:00",
+  "set_as_premiere": false,
   "proxy": null
 }
 ```
@@ -398,6 +411,9 @@ GET /api/v1/queue/jobs/{job_id}
   "user_id": "usr_10293",
   "status": "processing",
   "title": "Synced Multi-Channel Broadcast",
+  "visibility": "PRIVATE",
+  "scheduled_publish_time": "2026-10-25 18:00",
+  "set_as_premiere": false,
   "created_at": "2026-09-29T11:00:23.880Z",
   "updated_at": "2026-09-29T11:01:05.120Z",
   "tasks": [

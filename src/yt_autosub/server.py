@@ -71,6 +71,8 @@ class DirectUploadRequest(BaseModel):
     tags: List[str] = []
     thumbnail_path: Optional[str] = None
     visibility: Visibility = Visibility.PRIVATE
+    scheduled_publish_time: Optional[str] = None
+    set_as_premiere: bool = False
     proxy: Optional[ProxyConfig] = None
 
 # --- REST Endpoints ---
@@ -189,6 +191,8 @@ async def upload_video_endpoint(req: DirectUploadRequest):
         tags=req.tags,
         thumbnail_path=req.thumbnail_path,
         visibility=req.visibility,
+        scheduled_publish_time=req.scheduled_publish_time,
+        set_as_premiere=req.set_as_premiere,
     )
 
     result = await upload_video(task=task, headless=True, proxy=req.proxy)
@@ -206,6 +210,8 @@ class QueueUploadRequest(BaseModel):
     tags: List[str] = []
     thumbnail_path: Optional[str] = None
     visibility: str = "PRIVATE"
+    scheduled_publish_time: Optional[str] = None
+    set_as_premiere: bool = False
     proxy: Optional[ProxyConfig] = None
 
 @app.post("/api/v1/queue/upload", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_api_key)])
@@ -221,6 +227,8 @@ async def enqueue_upload(req: QueueUploadRequest):
         tags=req.tags,
         thumbnail_path=req.thumbnail_path,
         visibility=req.visibility,
+        scheduled_publish_time=req.scheduled_publish_time,
+        set_as_premiere=req.set_as_premiere,
         proxy=req.proxy,
     )
     return {
