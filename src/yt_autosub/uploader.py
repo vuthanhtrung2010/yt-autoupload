@@ -44,6 +44,9 @@ async def wait_for_upload_transfer_complete(
     last_label = ""
 
     while (time.monotonic() - start_ts) < timeout_seconds:
+        if page.is_closed():
+            return False, "Browser page was closed or killed unexpectedly"
+
         try:
             state = await page.evaluate("""() => {
                 const dialog = document.querySelector('ytcp-uploads-dialog');
@@ -198,18 +201,25 @@ async def upload_video(
     log_label = f"{task.user_id}:{task.account_alias}" if (task.user_id and task.account_alias) else account_id
     logger.info(f"[{log_label}] Starting upload: '{task.title}' -> {task.video_path}")
 
-    context = await launch_account_browser(
-        account_id=task.account_id,
-        user_id=task.user_id,
-        account_alias=task.account_alias,
-        headless=headless,
-        proxy=proxy,
-        inject_cookies=True,
-    )
-    page = context.pages[0] if context.pages else await context.new_page()
-    upload_id = session_manager.register_upload(account_id, task.title, page)
+    context = None
+    page = None
+    upload_id = None
 
     try:
+        context = await asyncio.wait_for(
+            launch_account_browser(
+                account_id=task.account_id,
+                user_id=task.user_id,
+                account_alias=task.account_alias,
+                headless=headless,
+                proxy=proxy,
+                inject_cookies=True,
+            ),
+            timeout=60,
+        )
+        page = context.pages[0] if context.pages else await context.new_page()
+        upload_id = session_manager.register_upload(account_id, task.title, page)
+
         # Navigate to Studio
         logger.info(f"[{log_label}] Navigating to YouTube Studio...")
         await page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=60000)
@@ -425,14 +435,24 @@ async def upload_video(
             video_url=video_url,
         )
 
+    except asyncio.TimeoutError:
+        logger.error(f"[{account_id}] Upload timed out waiting for browser operation")
+        return UploadResult(
+            account_id=account_id,
+            video_path=task.video_path,
+            title=task.title,
+            success=False,
+            error_message="Browser operation timed out",
+        )
     except Exception as e:
         logger.exception(f"[{account_id}] Failed upload: {e}")
-        screenshot_path = LOGS_DIR / f"upload_error_{sanitize_identifier(account_id)}.png"
-        try:
-            await page.screenshot(path=str(screenshot_path))
-            logger.info(f"Saved failure screenshot to {screenshot_path}")
-        except Exception:
-            pass
+        if page and not page.is_closed():
+            screenshot_path = LOGS_DIR / f"upload_error_{sanitize_identifier(account_id)}.png"
+            try:
+                await page.screenshot(path=str(screenshot_path))
+                logger.info(f"Saved failure screenshot to {screenshot_path}")
+            except Exception:
+                pass
         return UploadResult(
             account_id=account_id,
             video_path=task.video_path,
@@ -441,5 +461,7 @@ async def upload_video(
             error_message=str(e),
         )
     finally:
-        session_manager.unregister_upload(upload_id)
-        await close_account_browser(context)
+        if upload_id:
+            session_manager.unregister_upload(upload_id)
+        if context:
+            await close_account_browser(context)

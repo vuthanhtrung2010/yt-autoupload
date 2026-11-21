@@ -123,6 +123,9 @@ class UploadQueueManager:
     def get_job(self, job_id: str) -> Optional[QueueJob]:
         return self.jobs.get(job_id)
 
+    def delete_job(self, job_id: str) -> bool:
+        return self.jobs.pop(job_id, None) is not None
+
     def list_jobs(self, user_id: Optional[str] = None) -> List[QueueJob]:
         if user_id:
             return [j for j in self.jobs.values() if j.user_id == user_id]
@@ -133,6 +136,10 @@ class UploadQueueManager:
         while self._running:
             try:
                 job, channel_task = await self.queue.get()
+                if job.job_id not in self.jobs:
+                    self.queue.task_done()
+                    continue
+
                 job.status = "processing"
                 job.updated_at = utc_now()
                 channel_task.status = "uploading"
@@ -159,13 +166,25 @@ class UploadQueueManager:
                 )
 
                 try:
-                    result = await upload_video(task=task, headless=True, proxy=job.proxy)
+                    result = await asyncio.wait_for(
+                        upload_video(task=task, headless=True, proxy=job.proxy),
+                        timeout=1980,
+                    )
                     if result.success:
                         channel_task.status = "completed"
                         channel_task.video_url = result.video_url
                     else:
                         channel_task.status = "failed"
                         channel_task.error_message = result.error_message
+                except asyncio.TimeoutError:
+                    logger.error(f"Worker {worker_id} timed out uploading for {channel_task.account_alias}")
+                    channel_task.status = "failed"
+                    channel_task.error_message = "Upload timed out (browser exceeded maximum duration)"
+                except asyncio.CancelledError:
+                    logger.warning(f"Worker {worker_id} cancelled while uploading for {channel_task.account_alias}")
+                    channel_task.status = "failed"
+                    channel_task.error_message = "Upload cancelled or interrupted"
+                    raise
                 except Exception as e:
                     logger.exception(f"Worker {worker_id} error uploading for {channel_task.account_alias}: {e}")
                     channel_task.status = "failed"

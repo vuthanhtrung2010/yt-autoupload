@@ -246,6 +246,14 @@ async def get_queue_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     return job.to_dict()
 
+@app.delete("/api/v1/queue/jobs/{job_id}", dependencies=[Depends(verify_api_key)])
+async def delete_queue_job(job_id: str):
+    """Remove a job from the in-memory upload queue."""
+    deleted = queue_manager.delete_job(job_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"message": f"Job {job_id} removed from queue"}
+
 @app.get("/api/v1/queue/jobs", dependencies=[Depends(verify_api_key)])
 async def list_queue_jobs(user_id: Optional[str] = Query(None)):
     """List queue jobs, optionally filtered by user_id."""
