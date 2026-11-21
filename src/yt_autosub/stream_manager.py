@@ -210,6 +210,119 @@ class StreamingAuthSession:
         except Exception as e:
             logger.debug(f"[{self.session_id}] Error handling input: {e}")
 
+    @staticmethod
+    def _find_video_file_on_server(filename: str) -> Optional[str]:
+        """Search common project/temp directories for a matching video filename."""
+        if not filename:
+            return None
+        from pathlib import Path
+        from yt_autosub.config import BASE_DIR, DATA_DIR
+        safe_name = Path(filename).name
+        search_roots = [DATA_DIR, BASE_DIR, Path("/tmp")]
+        # Also check sibling frontend/upload directories if present
+        sibling_fe = BASE_DIR.parent / "yt-autosub-fe"
+        if sibling_fe.exists():
+            search_roots.append(sibling_fe)
+        for root in search_roots:
+            if not root.exists():
+                continue
+            try:
+                for match in root.rglob(safe_name):
+                    if match.is_file():
+                        return str(match)
+            except Exception:
+                continue
+        return None
+
+    async def scan_interrupted_uploads(self) -> list[dict]:
+        """Scan YouTube Studio Content table rows for interrupted or in-progress uploads."""
+        if not self.page or self.page.is_closed():
+            raise RuntimeError("Browser page is not open")
+
+        import re
+        rows = await self.page.evaluate("""() => {
+            const rowEls = Array.from(document.querySelectorAll('ytcp-video-row'));
+            return rowEls.map((row, idx) => {
+                const titleEl = row.querySelector('#video-title, a#video-title, .video-title-text');
+                const title = titleEl ? titleEl.innerText.trim() : `Row #${idx + 1}`;
+                const text = (row.innerText || '').trim();
+                const resumeBtn = row.querySelector(
+                    '#resume-upload-button, ytcp-button[id*="resume" i], button[aria-label*="Resume" i], button[aria-label*="Tiếp tục" i]'
+                ) || Array.from(row.querySelectorAll('ytcp-button, button')).find(
+                    b => /tiếp tục tải lên|resume upload/i.test(b.innerText || '')
+                );
+                const cancelBtn = row.querySelector('#cancel-upload-button') || Array.from(row.querySelectorAll('ytcp-button, button')).find(
+                    b => /huỷ tải lên|hủy tải lên|cancel upload/i.test(b.innerText || '')
+                );
+                const isInterrupted = /bị gián đoạn|interrupted|resume upload|tiếp tục tải lên/i.test(text);
+                const isUploading = /đã tải được|uploaded|uploading|đang tải lên/i.test(text) || Boolean(cancelBtn);
+                return {
+                    row_index: idx,
+                    title,
+                    text,
+                    can_resume: Boolean(resumeBtn),
+                    can_cancel: Boolean(cancelBtn),
+                    is_interrupted: isInterrupted,
+                    is_uploading: isUploading,
+                };
+            });
+        }""")
+
+        results = []
+        for r in rows:
+            if not (r.get("is_interrupted") or r.get("is_uploading") or r.get("can_resume")):
+                continue
+            row_text = r.get("text", "")
+            fn_match = re.search(r"([A-Za-z0-9_.\-]+\.(?:mp4|mov|mkv|avi|webm|m4v))", row_text, re.IGNORECASE)
+            expected_filename = fn_match.group(1) if fn_match else None
+            matched_path = self._find_video_file_on_server(expected_filename) if expected_filename else None
+
+            pct_match = re.search(r"(\d+\s*%)", row_text)
+            results.append({
+                "row_index": r["row_index"],
+                "title": r["title"],
+                "can_resume": r["can_resume"],
+                "can_cancel": r["can_cancel"],
+                "is_interrupted": r["is_interrupted"],
+                "progress_hint": pct_match.group(1) if pct_match else ("Interrupted" if r["is_interrupted"] else "Uploading"),
+                "expected_filename": expected_filename,
+                "matched_path": matched_path,
+                "snippet": " | ".join(line.strip() for line in row_text.splitlines() if line.strip())[:220],
+            })
+        return results
+
+    async def resume_interrupted_upload(self, row_index: int, video_path: str) -> dict:
+        """Click 'Resume upload' on the specified ytcp-video-row and feed the local video file via file chooser."""
+        if not self.page or self.page.is_closed():
+            raise RuntimeError("Browser page is not open")
+
+        from pathlib import Path
+        file_path = Path(video_path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Video file not found on server: {video_path}")
+
+        row = self.page.locator("ytcp-video-row").nth(row_index)
+        if await row.count() == 0:
+            raise ValueError(f"Row index {row_index} not found on current page")
+
+        resume_btn = row.locator(
+            "#resume-upload-button, ytcp-button[id*='resume' i], "
+            "ytcp-button:has-text('Tiếp tục tải lên'), ytcp-button:has-text('Resume upload'), "
+            "button:has-text('Tiếp tục tải lên'), button:has-text('Resume upload')"
+        ).first
+
+        await resume_btn.wait_for(state="visible", timeout=10000)
+        await resume_btn.scroll_into_view_if_needed()
+
+        async with self.page.expect_file_chooser(timeout=15000) as fc_info:
+            await resume_btn.click()
+        file_chooser = await fc_info.value
+        await file_chooser.set_files(str(file_path.resolve()))
+
+        self._action_event.set()
+        logger.info(f"[{self.session_id}] Resumed interrupted upload on row {row_index} with {file_path}")
+        return {"status": "resumed", "row_index": row_index, "video_path": str(file_path.resolve())}
+
     async def broadcast(self, message: dict):
         """Send JSON message to all connected WebSocket clients."""
         dead_clients = set()

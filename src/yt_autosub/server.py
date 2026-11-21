@@ -360,6 +360,36 @@ async def close_diagnostic_session(session_id: str):
     await session.close()
     return {"message": f"Diagnostic session {session_id} closed"}
 
+class ResumeUploadRequest(BaseModel):
+    row_index: int = Field(..., ge=0, description="Zero-based ytcp-video-row index on Studio Content page")
+    video_path: str = Field(..., description="Absolute or server-accessible path to the original video file")
+
+@app.post("/api/v1/diagnostic/session/{session_id}/scan-interrupted", dependencies=[Depends(verify_api_key)])
+async def scan_interrupted_uploads_endpoint(session_id: str):
+    """Scan the current YouTube Studio Content page for interrupted or in-progress uploads."""
+    session = session_manager.get_session(session_id)
+    if not session or not session.page or session.page.is_closed():
+        raise HTTPException(status_code=404, detail="Active diagnostic browser session not found")
+    items = await session.scan_interrupted_uploads()
+    return {"items": items, "url": session.page.url}
+
+@app.post("/api/v1/diagnostic/session/{session_id}/resume-upload", dependencies=[Depends(verify_api_key)])
+async def resume_interrupted_upload_endpoint(session_id: str, req: ResumeUploadRequest):
+    """Click 'Resume upload' on an interrupted row and feed the server file via Playwright file chooser."""
+    session = session_manager.get_session(session_id)
+    if not session or not session.page or session.page.is_closed():
+        raise HTTPException(status_code=404, detail="Active diagnostic browser session not found")
+    try:
+        result = await session.resume_interrupted_upload(row_index=req.row_index, video_path=req.video_path)
+        return result
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception(f"[{session_id}] Failed to resume upload on row {req.row_index}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/diagnostic/logs", dependencies=[Depends(verify_api_key)])
 async def list_diagnostic_logs():
     """List recent error screenshots in data/logs."""
@@ -821,6 +851,7 @@ async def admin_diagnostic_page():
           <input id="urlBar" placeholder="Current browser URL..." onkeydown="if(event.key==='Enter') navigateUrl()" />
           <button class="inline" onclick="navigateUrl()">Go</button>
           <button class="inline secondary" onclick="goStudioContent()">Studio Content</button>
+          <button class="inline" onclick="scanInterrupted()">Scan Interrupted</button>
           <button class="inline danger" id="closeBtn" onclick="closeCurrentSession()" style="display:none;">Close Browser</button>
         </div>
 
@@ -833,6 +864,14 @@ async def admin_diagnostic_page():
           <div id="overlay" class="overlay">No browser attached. Launch a diagnostic browser on the left to inspect YouTube Studio.</div>
           <canvas id="screen" width="{VIEWPORT_WIDTH}" height="{VIEWPORT_HEIGHT}" tabindex="0"></canvas>
         </div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h3 style="margin-bottom:0;">Interrupted / Uploading Videos on Current Page</h3>
+          <button class="inline secondary" onclick="scanInterrupted()">Scan Page</button>
+        </div>
+        <div id="interruptedList" class="muted">Navigate to YouTube Studio Content (Videos) and click "Scan Page" to detect interrupted uploads and feed their local video file.</div>
       </div>
     </div>
   </div>
@@ -1129,6 +1168,72 @@ async def admin_diagnostic_page():
       if (currentWs && currentMode === 'diagnostic') {{
         currentWs.send(JSON.stringify({{ type: 'navigate', url: dest }}));
       }}
+    }}
+
+    async function scanInterrupted() {{
+      const listEl = document.getElementById('interruptedList');
+      if (!currentSessionId || currentMode !== 'diagnostic') {{
+        listEl.innerHTML = '<span class="muted">Attach a diagnostic browser session first.</span>';
+        return;
+      }}
+      listEl.innerHTML = '<span class="muted">Scanning Studio Content rows...</span>';
+      const res = await fetch(`/api/v1/diagnostic/session/${{currentSessionId}}/scan-interrupted`, {{
+        method: 'POST',
+        headers: apiHeaders(),
+      }});
+      if (!res.ok) {{
+        const err = await res.text();
+        listEl.innerHTML = `<span style="color:#fca5a5;">Scan failed: ${{err}}</span>`;
+        return;
+      }}
+      const data = await res.json();
+      const items = data.items || [];
+      if (items.length === 0) {{
+        listEl.innerHTML = '<span class="muted">No interrupted or active uploads detected on this page. (Make sure you are on Studio Content / Videos.)</span>';
+        return;
+      }}
+      listEl.innerHTML = items.map(it => {{
+        const badgeCls = it.can_resume ? 'err' : 'warn';
+        const badgeTxt = it.can_resume ? 'Interrupted (Resume Ready)' : it.progress_hint;
+        const suggestedPath = it.matched_path || (it.expected_filename ? `data/${{it.expected_filename}}` : '');
+        return `
+          <div class="item">
+            <div style="display:flex; justify-content:space-between; gap:8px; align-items:center;">
+              <strong>#${{it.row_index + 1}} — ${{it.title}}</strong>
+              <span class="badge ${{badgeCls}}">${{badgeTxt}}</span>
+            </div>
+            <div class="muted" style="margin-top:4px;">${{it.snippet}}</div>
+            ${{it.expected_filename ? `<div style="margin-top:4px; color:#93c5fd;">Expected file: <code>${{it.expected_filename}}</code></div>` : ''}}
+            ${{it.can_resume ? `
+              <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+                <input id="resumePath_${{it.row_index}}" value="${{suggestedPath}}" placeholder="Full path on server (e.g. /home/.../video.mp4)" style="flex:1; margin:0;" />
+                <button class="inline" onclick="resumeInterrupted(${{it.row_index}})">Resume Upload</button>
+              </div>
+            ` : `<div class="muted" style="margin-top:6px;">Wait or click Reload if this upload is stale so YouTube shows "Resume upload".</div>`}}
+          </div>
+        `;
+      }}).join('');
+    }}
+
+    async function resumeInterrupted(rowIndex) {{
+      const input = document.getElementById(`resumePath_${{rowIndex}}`);
+      const video_path = input ? input.value.trim() : '';
+      if (!video_path) {{
+        alert('Please enter the server file path for this video.');
+        return;
+      }}
+      const res = await fetch(`/api/v1/diagnostic/session/${{currentSessionId}}/resume-upload`, {{
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify({{ row_index: rowIndex, video_path }})
+      }});
+      const data = await res.json();
+      if (!res.ok) {{
+        alert('Resume failed: ' + (data.detail || JSON.stringify(data)));
+        return;
+      }}
+      streamInfo.textContent = `Resumed row #${{rowIndex + 1}} with ${{data.video_path}} — keep browser open until 100%!`;
+      setTimeout(scanInterrupted, 2500);
     }}
 
     function getCoords(e) {{

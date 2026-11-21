@@ -60,3 +60,39 @@ def test_diagnostic_endpoints():
     logs_res = client.get("/api/v1/diagnostic/logs")
     assert logs_res.status_code == 200
     assert "screenshots" in logs_res.json()
+
+    # Unknown session should return 404
+    scan_404 = client.post("/api/v1/diagnostic/session/nonexistent/scan-interrupted")
+    assert scan_404.status_code == 404
+
+    resume_404 = client.post(
+        "/api/v1/diagnostic/session/nonexistent/resume-upload",
+        json={"row_index": 0, "video_path": "README.md"},
+    )
+    assert resume_404.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_scan_interrupted_uploads_parses_filename():
+    from yt_autosub.stream_manager import StreamingAuthSession
+
+    sess = StreamingAuthSession("diag_test", "usr_1", "acc1", mode="diagnostic")
+    sess.page = MagicMock()
+    sess.page.is_closed.return_value = False
+    sess.page.evaluate = AsyncMock(return_value=[
+        {
+            "row_index": 2,
+            "title": "¿Y si Freud tenía razón?",
+            "text": "Quá trình tải lên bị gián đoạn\nNhấp vào \"Tiếp tục tải lên\" rồi chọn video_1795257522442.mp4 để tải tệp lên",
+            "can_resume": True,
+            "can_cancel": False,
+            "is_interrupted": True,
+            "is_uploading": False,
+        }
+    ])
+
+    items = await sess.scan_interrupted_uploads()
+    assert len(items) == 1
+    assert items[0]["row_index"] == 2
+    assert items[0]["can_resume"] is True
+    assert items[0]["expected_filename"] == "video_1795257522442.mp4"
