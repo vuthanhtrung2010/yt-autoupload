@@ -9,6 +9,7 @@ from yt_autosub.uploader import wait_for_upload_transfer_complete
 @pytest.mark.asyncio
 async def test_wait_for_upload_transfer_waits_until_complete():
     page = MagicMock()
+    page.is_closed.return_value = False
     # Simulate: 9% -> 51% -> Upload complete
     page.evaluate = AsyncMock(side_effect=[
         {"dialogOpen": True, "hasProgress": True, "labelText": "Đang tải lên 9% ...", "barValue": 9, "isUploadingAttr": True, "hasErrorAttr": False, "errText": ""},
@@ -16,7 +17,7 @@ async def test_wait_for_upload_transfer_waits_until_complete():
         {"dialogOpen": True, "hasProgress": True, "labelText": "Đã tải lên xong ... Đang xử lý", "barValue": 100, "isUploadingAttr": False, "hasErrorAttr": False, "errText": ""},
     ])
 
-    ok, err = await wait_for_upload_transfer_complete(page, account_id="test_acc", timeout_seconds=30, stall_timeout_seconds=20)
+    ok, err = await wait_for_upload_transfer_complete(page, account_id="test_acc")
     assert ok is True
     assert err is None
     assert page.evaluate.await_count == 3
@@ -25,6 +26,7 @@ async def test_wait_for_upload_transfer_waits_until_complete():
 @pytest.mark.asyncio
 async def test_wait_for_upload_transfer_detects_error():
     page = MagicMock()
+    page.is_closed.return_value = False
     page.evaluate = AsyncMock(return_value={
         "dialogOpen": True,
         "hasProgress": True,
@@ -35,7 +37,7 @@ async def test_wait_for_upload_transfer_detects_error():
         "errText": "Daily upload limit reached",
     })
 
-    ok, err = await wait_for_upload_transfer_complete(page, account_id="test_acc", timeout_seconds=30)
+    ok, err = await wait_for_upload_transfer_complete(page, account_id="test_acc")
     assert ok is False
     assert "Daily upload limit reached" in err
 
@@ -96,3 +98,28 @@ async def test_scan_interrupted_uploads_parses_filename():
     assert items[0]["row_index"] == 2
     assert items[0]["can_resume"] is True
     assert items[0]["expected_filename"] == "video_1795257522442.mp4"
+
+
+@pytest.mark.asyncio
+async def test_queue_validation_error_marks_job_failed():
+    import asyncio
+    from yt_autosub.queue_manager import UploadQueueManager
+
+    mgr = UploadQueueManager(concurrency=1)
+    mgr.start_workers()
+    try:
+        job = mgr.create_job(
+            job_id="bad_file_job",
+            user_id="usr_1",
+            account_aliases=["acc1"],
+            video_path="/tmp/definitely_does_not_exist_123456.mp4",
+            title="Missing Video Test",
+        )
+        await asyncio.wait_for(mgr.queue.join(), timeout=5)
+        assert job.status == "failed"
+        assert job.tasks[0].status == "failed"
+        assert job.tasks[0].error_message is not None
+    finally:
+        mgr._running = False
+        for w in mgr.workers:
+            w.cancel()

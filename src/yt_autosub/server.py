@@ -357,7 +357,12 @@ async def list_diagnostic_sessions():
         }
         for u in session_manager.active_uploads.values()
     ]
-    return {"sessions": sessions, "active_uploads": uploads}
+    from yt_autosub.browser import get_browser_pool_status
+    return {
+        "sessions": sessions,
+        "active_uploads": uploads,
+        "browser_pool": get_browser_pool_status(),
+    }
 
 @app.delete("/api/v1/diagnostic/session/{session_id}", dependencies=[Depends(verify_api_key)])
 async def close_diagnostic_session(session_id: str):

@@ -31,19 +31,19 @@ async def wait_for_upload_transfer_complete(
     page: Page,
     account_id: str,
     upload_id: Optional[str] = None,
-    timeout_seconds: int = 1800,
-    stall_timeout_seconds: int = 240,
+    timeout_seconds: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Wait inside ytcp-uploads-dialog until the video file transfer reaches 100%
-    (upload complete / checks / processing started) or an error occurs.
-    Prevents closing the browser mid-upload.
+    (upload complete / checks / processing started) or an explicit error occurs.
+    Never artificially times out when timeout_seconds is None so large/slow uploads
+    always complete instead of being aborted mid-transfer.
     """
     start_ts = time.monotonic()
-    last_progress_ts = start_ts
+    last_log_ts = start_ts
     last_label = ""
 
-    while (time.monotonic() - start_ts) < timeout_seconds:
+    while timeout_seconds is None or (time.monotonic() - start_ts) < timeout_seconds:
         if page.is_closed():
             return False, "Browser page was closed or killed unexpectedly"
 
@@ -89,12 +89,13 @@ async def wait_for_upload_transfer_complete(
         if has_error:
             return False, f"YouTube reported upload error: {err_text or label_text}"
 
-        if label_text and label_text != last_label:
+        now = time.monotonic()
+        if label_text and (label_text != last_label or (now - last_log_ts) >= 60):
             logger.info(f"[{account_id}] Upload progress: {label_text}")
             if upload_id:
                 session_manager.update_upload_progress(upload_id, label_text)
             last_label = label_text
-            last_progress_ts = time.monotonic()
+            last_log_ts = now
 
         # Determine if file upload transfer is still in progress
         pct_match = re.search(r"(\d+)\s*%", label_text)
@@ -118,9 +119,6 @@ async def wait_for_upload_transfer_complete(
 
         if bar_val is not None and bar_val >= 100 and not is_uploading_attr and pct is None:
             return True, None
-
-        if (time.monotonic() - last_progress_ts) > stall_timeout_seconds:
-            return False, f"Upload stalled for {stall_timeout_seconds}s at: '{label_text}'"
 
         await asyncio.sleep(3)
 
@@ -191,7 +189,7 @@ async def upload_video(
     task: VideoUploadTask,
     headless: bool = True,
     proxy: Optional[ProxyConfig] = None,
-    timeout_seconds: int = 1800,
+    timeout_seconds: Optional[int] = None,
 ) -> UploadResult:
     """
     Perform complete browser automation to upload a video to YouTube Studio.
@@ -409,24 +407,102 @@ async def upload_video(
                 error_message=transfer_err or "Video file upload did not complete",
             )
 
-        # Publish / Save Button (#done-button)
-        logger.info(f"[{account_id}] Clicking publish / save button...")
+        # Re-verify instant visibility radio is actually checked (YouTube Studio can reset
+        # Step 4 selection while uploading or if an overlay intercepted the earlier click)
+        if not task.scheduled_publish_time:
+            vis_radio = page.locator(
+                f"tp-yt-paper-radio-button[name='{task.visibility.value}'], [name='{task.visibility.value}']"
+            ).first
+            for attempt in range(3):
+                await vis_radio.wait_for(state="visible", timeout=15000)
+                await vis_radio.scroll_into_view_if_needed()
+                checked = await vis_radio.get_attribute("aria-checked")
+                if checked == "true":
+                    break
+                logger.info(f"[{account_id}] Ensuring visibility radio '{task.visibility.value}' is selected (attempt {attempt + 1})...")
+                await vis_radio.click(force=True)
+                await asyncio.sleep(0.8)
+
+        await dismiss_popovers(page)
+
+        # Wait until #done-button is visible AND enabled before clicking
         done_btn = page.locator("#done-button").first
         await done_btn.wait_for(state="visible", timeout=15000)
-        await done_btn.click()
+        for _ in range(30):
+            is_disabled = await done_btn.evaluate(
+                "el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+            )
+            if not is_disabled:
+                break
+            await asyncio.sleep(1)
 
-        # Wait for confirmation dialog (e.g. Video published/scheduled) or modal close
-        logger.info(f"[{account_id}] Waiting for publish/schedule confirmation...")
-        confirm_dialog = page.locator("ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog").first
-        try:
-            await confirm_dialog.wait_for(state="visible", timeout=20000)
-        except Exception:
-            await asyncio.sleep(5)
+        # Click Publish / Save Button (#done-button) and VERIFY it actually leaves Draft state
+        published_confirmed = False
+        publish_err: Optional[str] = None
+        for attempt in range(3):
+            logger.info(f"[{account_id}] Clicking publish / save button (attempt {attempt + 1}/3)...")
+            await done_btn.scroll_into_view_if_needed()
+            await done_btn.click()
+
+            # Poll up to 15s for publish confirmation dialog, secondary warning dialog, or modal close
+            for _ in range(15):
+                await asyncio.sleep(1)
+                confirm_dialog = page.locator(
+                    "ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog"
+                ).first
+                if await confirm_dialog.count() > 0 and await confirm_dialog.is_visible():
+                    published_confirmed = True
+                    break
+
+                # Handle "Checks still running / Publish anyway" confirmation prompt if shown
+                pub_anyway = page.locator(
+                    "ytcp-confirmation-dialog #confirm-button, "
+                    "ytcp-button#secondary-action-button:has-text('Publish anyway'), "
+                    "ytcp-button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway')"
+                ).first
+                if await pub_anyway.count() > 0 and await pub_anyway.is_visible():
+                    logger.info(f"[{account_id}] Confirming 'Publish anyway' dialog...")
+                    await pub_anyway.click()
+                    await asyncio.sleep(2)
+                    continue
+
+                upload_dialog = page.locator("ytcp-uploads-dialog").first
+                if await upload_dialog.count() == 0 or not await upload_dialog.is_visible():
+                    published_confirmed = True
+                    break
+
+                # Check for explicit validation/publish error banner inside dialog
+                err_banner = upload_dialog.locator(".error-short, #error-message, ytcp-error-banner").first
+                if await err_banner.count() > 0 and await err_banner.is_visible():
+                    txt = (await err_banner.inner_text()).strip()
+                    if txt:
+                        publish_err = f"YouTube blocked publish: {txt}"
+                        break
+
+            if published_confirmed or publish_err:
+                break
+            await dismiss_popovers(page)
+
+        if not published_confirmed:
+            screenshot_path = LOGS_DIR / f"upload_draft_error_{sanitize_identifier(account_id)}.png"
+            try:
+                await page.screenshot(path=str(screenshot_path))
+                logger.info(f"Saved draft-failure screenshot to {screenshot_path}")
+            except Exception:
+                pass
+            return UploadResult(
+                account_id=account_id,
+                video_path=task.video_path,
+                title=task.title,
+                success=False,
+                video_url=video_url,
+                error_message=publish_err or "Video remained in draft: publish/save confirmation was not detected",
+            )
 
         # Dismiss final dialog if present
         await dismiss_popovers(page)
 
-        logger.info(f"[{account_id}] Successfully uploaded: {task.title} (URL: {video_url or 'N/A'})")
+        logger.info(f"[{account_id}] Successfully published/scheduled: {task.title} (URL: {video_url or 'N/A'})")
         return UploadResult(
             account_id=account_id,
             video_path=task.video_path,

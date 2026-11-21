@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional, Any
 from loguru import logger
 from yt_autosub.models import VideoUploadTask, Visibility
-from yt_autosub.config import get_channel_id, ProxyConfig
+from yt_autosub.config import get_channel_id, ProxyConfig, MAX_QUEUE_WORKERS
 from yt_autosub.uploader import upload_video
 
 def utc_now() -> datetime:
@@ -64,8 +64,8 @@ class QueueJob:
 class UploadQueueManager:
     _instance = None
 
-    def __init__(self, concurrency: int = 2):
-        self.concurrency = concurrency
+    def __init__(self, concurrency: Optional[int] = None):
+        self.concurrency = max(1, concurrency if concurrency is not None else MAX_QUEUE_WORKERS)
         self.queue: asyncio.Queue = asyncio.Queue()
         self.jobs: Dict[str, QueueJob] = {}
         self.workers: List[asyncio.Task] = []
@@ -144,42 +144,35 @@ class UploadQueueManager:
                 job.updated_at = utc_now()
                 channel_task.status = "uploading"
                 channel_task.started_at = utc_now()
-                
-                vis = Visibility.PRIVATE
-                try:
-                    vis = Visibility(job.visibility.upper())
-                except Exception:
-                    pass
-
-                task = VideoUploadTask(
-                    user_id=job.user_id,
-                    account_alias=channel_task.account_alias,
-                    account_id=get_channel_id(job.user_id, channel_task.account_alias),
-                    video_path=job.video_path,
-                    title=job.title,
-                    description=job.description,
-                    tags=job.tags,
-                    thumbnail_path=job.thumbnail_path,
-                    visibility=vis,
-                    scheduled_publish_time=job.scheduled_publish_time,
-                    set_as_premiere=job.set_as_premiere,
-                )
 
                 try:
-                    result = await asyncio.wait_for(
-                        upload_video(task=task, headless=True, proxy=job.proxy),
-                        timeout=1980,
+                    vis = Visibility.PRIVATE
+                    try:
+                        vis = Visibility(job.visibility.upper())
+                    except Exception:
+                        pass
+
+                    task = VideoUploadTask(
+                        user_id=job.user_id,
+                        account_alias=channel_task.account_alias,
+                        account_id=get_channel_id(job.user_id, channel_task.account_alias),
+                        video_path=job.video_path,
+                        title=job.title,
+                        description=job.description,
+                        tags=job.tags,
+                        thumbnail_path=job.thumbnail_path,
+                        visibility=vis,
+                        scheduled_publish_time=job.scheduled_publish_time,
+                        set_as_premiere=job.set_as_premiere,
                     )
+
+                    result = await upload_video(task=task, headless=True, proxy=job.proxy)
                     if result.success:
                         channel_task.status = "completed"
                         channel_task.video_url = result.video_url
                     else:
                         channel_task.status = "failed"
-                        channel_task.error_message = result.error_message
-                except asyncio.TimeoutError:
-                    logger.error(f"Worker {worker_id} timed out uploading for {channel_task.account_alias}")
-                    channel_task.status = "failed"
-                    channel_task.error_message = "Upload timed out (browser exceeded maximum duration)"
+                        channel_task.error_message = result.error_message or "Upload failed"
                 except asyncio.CancelledError:
                     logger.warning(f"Worker {worker_id} cancelled while uploading for {channel_task.account_alias}")
                     channel_task.status = "failed"
@@ -190,6 +183,9 @@ class UploadQueueManager:
                     channel_task.status = "failed"
                     channel_task.error_message = str(e)
                 finally:
+                    if channel_task.status == "uploading":
+                        channel_task.status = "failed"
+                        channel_task.error_message = channel_task.error_message or "Upload terminated unexpectedly"
                     channel_task.completed_at = utc_now()
                     self.queue.task_done()
                     self._update_job_status(job)
@@ -200,7 +196,9 @@ class UploadQueueManager:
 
     def _update_job_status(self, job: QueueJob):
         statuses = [t.status for t in job.tasks]
-        if all(s in ("completed", "failed") for s in statuses):
+        if not statuses:
+            job.status = "failed"
+        elif all(s in ("completed", "failed") for s in statuses):
             if all(s == "completed" for s in statuses):
                 job.status = "completed"
             elif any(s == "completed" for s in statuses):

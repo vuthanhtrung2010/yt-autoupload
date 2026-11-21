@@ -16,6 +16,10 @@ API_SECRET_KEY = os.getenv("YT_AUTOSUB_API_KEY", "")
 SERVER_HOST = os.getenv("YT_AUTOSUB_HOST", "127.0.0.1")
 SERVER_PORT = int(os.getenv("YT_AUTOSUB_PORT", "8000"))
 
+# Concurrency / Resource Limits (prevent browser freeze/OOM)
+MAX_CONCURRENT_BROWSERS = max(1, int(os.getenv("YT_AUTOSUB_MAX_BROWSERS", "2")))
+MAX_QUEUE_WORKERS = max(1, int(os.getenv("YT_AUTOSUB_MAX_WORKERS", "1")))
+
 def sanitize_identifier(text: str) -> str:
     """Sanitize user ID and account alias to avoid directory traversal or invalid chars."""
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", text)

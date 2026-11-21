@@ -424,11 +424,12 @@ class SessionManager:
         return self.active_uploads.get(upload_id)
 
     async def cleanup_stale_sessions(self, max_age_seconds: int = 1800):
-        """Close sessions older than max_age_seconds (30 minutes)."""
+        """Remove closed/finished sessions; never auto-timeout active diagnostic sessions."""
         now = time.time()
         stale_ids = [
             sid for sid, s in self.sessions.items()
-            if (now - s.created_at > max_age_seconds) or s.status in ("closed", "authenticated", "error")
+            if s.status in ("closed", "authenticated", "error")
+            or (s.mode != "diagnostic" and (now - s.created_at > max_age_seconds))
         ]
         for sid in stale_ids:
             s = self.sessions.pop(sid, None)
