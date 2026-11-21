@@ -1,6 +1,8 @@
 import asyncio
+import re
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from loguru import logger
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
@@ -8,8 +10,118 @@ from yt_autosub.config import LOGS_DIR, ProxyConfig, sanitize_identifier
 from yt_autosub.browser import launch_account_browser, close_account_browser
 from yt_autosub.models import VideoUploadTask, UploadResult
 from yt_autosub.auth import check_is_logged_in
+from yt_autosub.stream_manager import session_manager
 
 STUDIO_URL = "https://studio.youtube.com"
+
+_PROCESSING_OR_DONE_RE = re.compile(
+    r"(upload complete|checks? complete|checking|processing|processed|"
+    r"đã tải lên|tải lên hoàn tất|quá trình kiểm tra|đang kiểm tra|đang xử lý|đã xử lý|"
+    r"comprobación|procesando|subida completa)",
+    re.IGNORECASE,
+)
+_UPLOAD_ERROR_RE = re.compile(
+    r"(upload failed|failed to upload|processing abandoned|daily limit|duplicate|"
+    r"tải lên không thành công|lỗi tải lên|bị huỷ|vượt quá giới hạn)",
+    re.IGNORECASE,
+)
+
+
+async def wait_for_upload_transfer_complete(
+    page: Page,
+    account_id: str,
+    upload_id: Optional[str] = None,
+    timeout_seconds: int = 1800,
+    stall_timeout_seconds: int = 240,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Wait inside ytcp-uploads-dialog until the video file transfer reaches 100%
+    (upload complete / checks / processing started) or an error occurs.
+    Prevents closing the browser mid-upload.
+    """
+    start_ts = time.monotonic()
+    last_progress_ts = start_ts
+    last_label = ""
+
+    while (time.monotonic() - start_ts) < timeout_seconds:
+        try:
+            state = await page.evaluate("""() => {
+                const dialog = document.querySelector('ytcp-uploads-dialog');
+                if (!dialog) return { dialogOpen: false };
+
+                const errEl = dialog.querySelector('.error-short, #error-message, ytcp-error-banner, .error-details');
+                const errText = errEl && errEl.offsetParent !== null ? errEl.innerText.trim() : '';
+
+                const progComp = dialog.querySelector('ytcp-video-upload-progress');
+                if (!progComp) return { dialogOpen: true, hasProgress: false, errText };
+
+                const labelEl = progComp.querySelector('.progress-label');
+                const labelText = labelEl ? labelEl.innerText.trim() : progComp.innerText.trim();
+
+                const bar = progComp.querySelector('tp-yt-paper-progress');
+                const barValue = bar ? bar.getAttribute('value') : null;
+                const isUploadingAttr = progComp.hasAttribute('uploading');
+                const hasErrorAttr = progComp.hasAttribute('error');
+
+                return {
+                    dialogOpen: true,
+                    hasProgress: true,
+                    labelText,
+                    barValue: barValue !== null ? Number(barValue) : null,
+                    isUploadingAttr,
+                    hasErrorAttr,
+                    errText
+                };
+            }""")
+        except Exception as e:
+            return False, f"Browser page error while checking upload progress: {e}"
+
+        if not state.get("dialogOpen"):
+            return True, None
+
+        err_text = state.get("errText") or ""
+        label_text = state.get("labelText") or ""
+        has_error = bool(state.get("hasErrorAttr")) or bool(err_text) or bool(_UPLOAD_ERROR_RE.search(label_text))
+
+        if has_error:
+            return False, f"YouTube reported upload error: {err_text or label_text}"
+
+        if label_text and label_text != last_label:
+            logger.info(f"[{account_id}] Upload progress: {label_text}")
+            if upload_id:
+                session_manager.update_upload_progress(upload_id, label_text)
+            last_label = label_text
+            last_progress_ts = time.monotonic()
+
+        # Determine if file upload transfer is still in progress
+        pct_match = re.search(r"(\d+)\s*%", label_text)
+        pct = int(pct_match.group(1)) if pct_match else None
+        is_processing_or_done = bool(_PROCESSING_OR_DONE_RE.search(label_text))
+        is_uploading_attr = bool(state.get("isUploadingAttr"))
+        bar_val = state.get("barValue")
+
+        # File upload is done once processing/checks begin or 100% is reached without active uploading attr
+        if is_processing_or_done and not is_uploading_attr:
+            logger.info(f"[{account_id}] Video file transfer complete ({label_text}).")
+            return True, None
+
+        if pct is not None and pct >= 100 and not is_uploading_attr:
+            logger.info(f"[{account_id}] Video file transfer reached 100% ({label_text}).")
+            return True, None
+
+        if not state.get("hasProgress"):
+            # No progress widget means upload finished or wasn't needed
+            return True, None
+
+        if bar_val is not None and bar_val >= 100 and not is_uploading_attr and pct is None:
+            return True, None
+
+        if (time.monotonic() - last_progress_ts) > stall_timeout_seconds:
+            return False, f"Upload stalled for {stall_timeout_seconds}s at: '{label_text}'"
+
+        await asyncio.sleep(3)
+
+    return False, f"Upload timed out after {timeout_seconds}s (last status: '{last_label}')"
 
 async def dismiss_popovers(page: Page) -> None:
     """Dismiss any floating onboarding tooltips or guide cards without canceling dialogs."""
@@ -76,7 +188,7 @@ async def upload_video(
     task: VideoUploadTask,
     headless: bool = True,
     proxy: Optional[ProxyConfig] = None,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 1800,
 ) -> UploadResult:
     """
     Perform complete browser automation to upload a video to YouTube Studio.
@@ -95,6 +207,7 @@ async def upload_video(
         inject_cookies=True,
     )
     page = context.pages[0] if context.pages else await context.new_page()
+    upload_id = session_manager.register_upload(account_id, task.title, page)
 
     try:
         # Navigate to Studio
@@ -261,16 +374,45 @@ async def upload_video(
         except Exception:
             pass
 
+        # Wait for the actual video file upload transfer to finish (100%) BEFORE clicking Save/Publish,
+        # so closing the browser afterwards never aborts an in-progress upload!
+        logger.info(f"[{account_id}] Ensuring video file transfer completes before publishing...")
+        transfer_ok, transfer_err = await wait_for_upload_transfer_complete(
+            page,
+            account_id=account_id,
+            upload_id=upload_id,
+            timeout_seconds=timeout_seconds,
+        )
+        if not transfer_ok:
+            screenshot_path = LOGS_DIR / f"upload_error_{sanitize_identifier(account_id)}.png"
+            try:
+                await page.screenshot(path=str(screenshot_path))
+                logger.info(f"Saved failure screenshot to {screenshot_path}")
+            except Exception:
+                pass
+            return UploadResult(
+                account_id=account_id,
+                video_path=task.video_path,
+                title=task.title,
+                success=False,
+                video_url=video_url,
+                error_message=transfer_err or "Video file upload did not complete",
+            )
+
         # Publish / Save Button (#done-button)
         logger.info(f"[{account_id}] Clicking publish / save button...")
         done_btn = page.locator("#done-button").first
         await done_btn.wait_for(state="visible", timeout=15000)
         await done_btn.click()
 
-        # Wait for dialog completion
-        logger.info(f"[{account_id}] Waiting for upload processing confirmation...")
-        await asyncio.sleep(5)
-        
+        # Wait for confirmation dialog (e.g. Video published/scheduled) or modal close
+        logger.info(f"[{account_id}] Waiting for publish/schedule confirmation...")
+        confirm_dialog = page.locator("ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog").first
+        try:
+            await confirm_dialog.wait_for(state="visible", timeout=20000)
+        except Exception:
+            await asyncio.sleep(5)
+
         # Dismiss final dialog if present
         await dismiss_popovers(page)
 
@@ -299,4 +441,5 @@ async def upload_video(
             error_message=str(e),
         )
     finally:
+        session_manager.unregister_upload(upload_id)
         await close_account_browser(context)

@@ -26,12 +26,16 @@ class StreamingAuthSession:
         user_id: str,
         account_alias: str,
         proxy: Optional[ProxyConfig] = None,
+        mode: str = "auth",
+        target_url: Optional[str] = None,
     ):
         self.session_id = session_id
         self.user_id = user_id
         self.account_alias = account_alias
         self.channel_id = get_channel_id(user_id, account_alias)
         self.proxy = proxy
+        self.mode = mode  # "auth" or "diagnostic"
+        self.target_url = target_url
         self.status = "starting"
         self.error: Optional[str] = None
         self.created_at = time.time()
@@ -50,26 +54,30 @@ class StreamingAuthSession:
     async def start(self):
         """Initialize the isolated Camoufox browser and navigate to Studio."""
         try:
-            logger.info(f"[{self.session_id}] Launching browser for user={self.user_id}, alias={self.account_alias}")
+            logger.info(f"[{self.session_id}] Launching {self.mode} browser for user={self.user_id}, alias={self.account_alias}")
             self.context = await launch_account_browser(
                 user_id=self.user_id,
                 account_alias=self.account_alias,
                 headless=True,
                 proxy=self.proxy,
+                inject_cookies=(self.mode == "diagnostic"),
                 viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             )
             self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
-            
-            logger.info(f"[{self.session_id}] Navigating to {STUDIO_URL}...")
-            await self.page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=60000)
+
+            dest_url = self.target_url or STUDIO_URL
+            logger.info(f"[{self.session_id}] Navigating to {dest_url}...")
+            await self.page.goto(dest_url, wait_until="domcontentloaded", timeout=60000)
 
             self.status = "active"
             self._stream_task = asyncio.create_task(self._frame_loop())
-            self._auth_task = asyncio.create_task(self._auth_watcher())
+            if self.mode == "auth":
+                self._auth_task = asyncio.create_task(self._auth_watcher())
         except Exception as e:
             logger.exception(f"[{self.session_id}] Failed to start session: {e}")
             self.status = "error"
             self.error = str(e)
+            await self.broadcast({"type": "error", "error": str(e)})
             await self.close()
 
     async def _frame_loop(self):
@@ -180,6 +188,22 @@ class StreamingAuthSession:
                 dy = float(data.get("deltaY", 0))
                 await self.page.mouse.wheel(dx, dy)
 
+            elif msg_type == "navigate":
+                url = str(data.get("url", "")).strip()
+                if url:
+                    if not url.startswith(("http://", "https://")):
+                        url = "https://" + url
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            elif msg_type == "reload":
+                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+
+            elif msg_type == "back":
+                await self.page.go_back(wait_until="domcontentloaded", timeout=30000)
+
+            elif msg_type == "forward":
+                await self.page.go_forward(wait_until="domcontentloaded", timeout=30000)
+
             # Trigger immediate frame capture
             self._action_event.set()
 
@@ -214,7 +238,7 @@ class StreamingAuthSession:
             self.context = None
             self.page = None
 
-        if not self.is_authenticated:
+        if self.mode == "auth" and not self.is_authenticated:
             import shutil
             from yt_autosub.config import PROFILES_DIR, SESSIONS_DIR, sanitize_identifier
             clean_user = sanitize_identifier(self.user_id)
@@ -230,29 +254,61 @@ class StreamingAuthSession:
             except Exception as e:
                 logger.warning(f"[{self.session_id}] Could not purge profile dir: {e}")
 
+class ActiveUploadSession:
+    """Tracks a currently running upload browser so admins can inspect it live."""
+    def __init__(self, upload_id: str, account_id: str, title: str, page: Page):
+        self.upload_id = upload_id
+        self.account_id = account_id
+        self.title = title
+        self.page = page
+        self.progress = "Starting..."
+        self.started_at = time.time()
+
 class SessionManager:
-    """Registry for active interactive streaming sessions."""
+    """Registry for active interactive streaming sessions and live upload browsers."""
     def __init__(self):
         self.sessions: Dict[str, StreamingAuthSession] = {}
+        self.active_uploads: Dict[str, ActiveUploadSession] = {}
 
     def create_session(
         self,
         user_id: str,
         account_alias: str,
         proxy: Optional[ProxyConfig] = None,
+        mode: str = "auth",
+        target_url: Optional[str] = None,
     ) -> StreamingAuthSession:
-        session_id = f"sess_{uuid4().hex[:12]}"
+        prefix = "diag" if mode == "diagnostic" else "sess"
+        session_id = f"{prefix}_{uuid4().hex[:12]}"
         session = StreamingAuthSession(
             session_id=session_id,
             user_id=user_id,
             account_alias=account_alias,
             proxy=proxy,
+            mode=mode,
+            target_url=target_url,
         )
         self.sessions[session_id] = session
         return session
 
     def get_session(self, session_id: str) -> Optional[StreamingAuthSession]:
         return self.sessions.get(session_id)
+
+    def register_upload(self, account_id: str, title: str, page: Page) -> str:
+        upload_id = f"upl_{uuid4().hex[:12]}"
+        self.active_uploads[upload_id] = ActiveUploadSession(upload_id, account_id, title, page)
+        return upload_id
+
+    def update_upload_progress(self, upload_id: str, progress: str) -> None:
+        upl = self.active_uploads.get(upload_id)
+        if upl:
+            upl.progress = progress
+
+    def unregister_upload(self, upload_id: str) -> None:
+        self.active_uploads.pop(upload_id, None)
+
+    def get_upload(self, upload_id: str) -> Optional[ActiveUploadSession]:
+        return self.active_uploads.get(upload_id)
 
     async def cleanup_stale_sessions(self, max_age_seconds: int = 1800):
         """Close sessions older than max_age_seconds (30 minutes)."""
