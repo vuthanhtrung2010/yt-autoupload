@@ -19,6 +19,7 @@ from yt_autosub.config import (
 )
 from yt_autosub.models import Visibility, UploadResult, VideoUploadTask
 from yt_autosub.uploader import upload_video
+from yt_autosub.playlists import list_channel_playlists
 from yt_autosub.auth import test_session
 from yt_autosub.stream_manager import session_manager, VIEWPORT_WIDTH, VIEWPORT_HEIGHT
 from yt_autosub.queue_manager import UploadQueueManager
@@ -70,6 +71,7 @@ class DirectUploadRequest(BaseModel):
     title: str
     description: str = ""
     tags: List[str] = []
+    playlists: List[str] = []
     thumbnail_path: Optional[str] = None
     visibility: Visibility = Visibility.PRIVATE
     scheduled_publish_time: Optional[str] = None
@@ -179,6 +181,27 @@ async def list_user_channels(user_id: str = Query(..., description="User ID")):
             })
     return {"user_id": user_id, "channels": channels}
 
+@app.get("/api/v1/channels/{account_alias}/playlists", dependencies=[Depends(verify_api_key)])
+async def get_channel_playlists_endpoint(
+    account_alias: str,
+    user_id: str = Query(..., description="User ID"),
+):
+    """Fetch playlists configured on the user's YouTube Studio channel."""
+    try:
+        playlists = await list_channel_playlists(
+            user_id=user_id,
+            account_alias=account_alias,
+            headless=True,
+        )
+        return {
+            "user_id": user_id,
+            "account_alias": account_alias,
+            "playlists": playlists,
+        }
+    except Exception as e:
+        logger.exception(f"Failed listing playlists for {user_id}:{account_alias}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/v1/upload", dependencies=[Depends(verify_api_key)])
 async def upload_video_endpoint(req: DirectUploadRequest):
     """Trigger automated video upload for a user's authenticated channel."""
@@ -190,6 +213,7 @@ async def upload_video_endpoint(req: DirectUploadRequest):
         title=req.title,
         description=req.description,
         tags=req.tags,
+        playlists=req.playlists,
         thumbnail_path=req.thumbnail_path,
         visibility=req.visibility,
         scheduled_publish_time=req.scheduled_publish_time,
@@ -209,6 +233,7 @@ class QueueUploadRequest(BaseModel):
     title: str
     description: str = ""
     tags: List[str] = []
+    playlists: List[str] = []
     thumbnail_path: Optional[str] = None
     visibility: str = "PRIVATE"
     scheduled_publish_time: Optional[str] = None
@@ -226,6 +251,7 @@ async def enqueue_upload(req: QueueUploadRequest):
         title=req.title,
         description=req.description,
         tags=req.tags,
+        playlists=req.playlists,
         thumbnail_path=req.thumbnail_path,
         visibility=req.visibility,
         scheduled_publish_time=req.scheduled_publish_time,

@@ -29,6 +29,7 @@ class QueueJob:
     tags: List[str]
     thumbnail_path: Optional[str]
     visibility: str
+    playlists: List[str] = field(default_factory=list)
     scheduled_publish_time: Optional[str] = None
     set_as_premiere: bool = False
     proxy: Optional[ProxyConfig] = None
@@ -44,6 +45,7 @@ class QueueJob:
             "status": self.status,
             "title": self.title,
             "visibility": self.visibility,
+            "playlists": self.playlists,
             "scheduled_publish_time": self.scheduled_publish_time,
             "set_as_premiere": self.set_as_premiere,
             "created_at": self.created_at.isoformat(),
@@ -94,6 +96,7 @@ class UploadQueueManager:
         title: str,
         description: str = "",
         tags: Optional[List[str]] = None,
+        playlists: Optional[List[str]] = None,
         thumbnail_path: Optional[str] = None,
         visibility: str = "PRIVATE",
         scheduled_publish_time: Optional[str] = None,
@@ -108,6 +111,7 @@ class UploadQueueManager:
             title=title,
             description=description,
             tags=tags or [],
+            playlists=playlists or [],
             thumbnail_path=thumbnail_path,
             visibility=visibility,
             scheduled_publish_time=scheduled_publish_time,
@@ -160,6 +164,7 @@ class UploadQueueManager:
                         title=job.title,
                         description=job.description,
                         tags=job.tags,
+                        playlists=job.playlists,
                         thumbnail_path=job.thumbnail_path,
                         visibility=vis,
                         scheduled_publish_time=job.scheduled_publish_time,

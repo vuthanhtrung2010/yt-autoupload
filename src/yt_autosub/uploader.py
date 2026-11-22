@@ -185,6 +185,86 @@ async def trigger_upload_dialog(page: Page) -> bool:
     except Exception:
         return False
 
+
+async def select_playlists(page: Page, account_id: str, playlists: list[str]) -> None:
+    """Open YouTube Studio's Playlists selector inside upload details and select matching playlists."""
+    wanted = [p.strip() for p in playlists if p and p.strip()]
+    if not wanted:
+        return
+
+    logger.info(f"[{account_id}] Selecting playlists: {wanted}")
+    trigger = page.locator(
+        "ytcp-video-metadata-playlists ytcp-text-dropdown-trigger, "
+        "ytcp-video-metadata-playlists ytcp-dropdown-trigger, "
+        "ytcp-video-metadata-playlists #playlists-dropdown, "
+        "ytcp-video-metadata-playlists [role='button']"
+    ).first
+
+    if await trigger.count() == 0:
+        logger.warning(f"[{account_id}] Playlist dropdown trigger not found in upload dialog")
+        return
+
+    await trigger.scroll_into_view_if_needed()
+    await trigger.click()
+
+    dialog = page.locator("ytcp-playlist-dialog").first
+    try:
+        await dialog.wait_for(state="visible", timeout=10000)
+    except Exception as e:
+        logger.warning(f"[{account_id}] Playlist dialog did not open: {e}")
+        return
+
+    await asyncio.sleep(0.8)
+
+    async def _try_check_playlist(target_name: str) -> bool:
+        target_lower = target_name.lower()
+        items = dialog.locator("ytcp-playlist-item, li, ytcp-checkbox-lit, [role='checkbox']")
+        count = await items.count()
+        for i in range(count):
+            item = items.nth(i)
+            try:
+                text = (await item.inner_text()).strip()
+            except Exception:
+                continue
+            lines = [ln.strip().lower() for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            if lines[0] == target_lower or text.lower() == target_lower:
+                checkbox = item.locator("ytcp-checkbox-lit, [role='checkbox'], #checkbox").first
+                target_el = checkbox if await checkbox.count() > 0 else item
+                checked_attr = await target_el.get_attribute("aria-checked")
+                if checked_attr != "true":
+                    await target_el.scroll_into_view_if_needed()
+                    await target_el.click()
+                    await asyncio.sleep(0.3)
+                return True
+        return False
+
+    search_input = dialog.locator("#search-input input, input[type='search'], input").first
+    has_search = await search_input.count() > 0 and await search_input.is_visible()
+
+    for name in wanted:
+        found = await _try_check_playlist(name)
+        if not found and has_search:
+            try:
+                await search_input.click(force=True)
+                await search_input.fill(name)
+                await asyncio.sleep(0.7)
+                found = await _try_check_playlist(name)
+                await search_input.fill("")
+                await asyncio.sleep(0.4)
+            except Exception:
+                pass
+        if not found:
+            logger.warning(f"[{account_id}] Playlist '{name}' not found on this channel; skipping")
+
+    done_btn = dialog.locator(
+        ".done-button, ytcp-button.done-button, button:has-text('Done'), button:has-text('Xong')"
+    ).first
+    if await done_btn.count() > 0:
+        await done_btn.click()
+        await asyncio.sleep(0.6)
+
 async def upload_video(
     task: VideoUploadTask,
     headless: bool = True,
@@ -281,6 +361,10 @@ async def upload_video(
             thumb_input = page.locator("input#file-loader[type='file'], input[type='file'][accept*='image']").first
             if await thumb_input.count() > 0:
                 await thumb_input.set_input_files(task.thumbnail_path)
+
+        # Select Playlists if provided
+        if task.playlists:
+            await select_playlists(page, account_id, task.playlists)
 
         # COPPA Audience Selection (Language-independent: name="VIDEO_MADE_FOR_KIDS_NOT_MFK")
         logger.info(f"[{account_id}] Selecting 'Not made for kids'...")

@@ -54,6 +54,7 @@ class VideoUploadTask(BaseModel):
     title: str = Field(..., description="Video title (up to 100 characters)")
     description: str = Field(default="", description="Video description text")
     tags: List[str] = Field(default_factory=list, description="List of search tags")
+    playlists: List[str] = Field(default_factory=list, description="Playlist titles to add the video to")
     thumbnail_path: Optional[str] = Field(default=None, description="Path to custom thumbnail image")
     visibility: Visibility = Field(default=Visibility.PRIVATE, description="Visibility: PRIVATE, UNLISTED, or PUBLIC")
     scheduled_publish_time: Optional[str] = Field(
