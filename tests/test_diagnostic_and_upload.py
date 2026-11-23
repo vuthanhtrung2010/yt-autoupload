@@ -123,3 +123,15 @@ async def test_queue_validation_error_marks_job_failed():
         mgr._running = False
         for w in mgr.workers:
             w.cancel()
+
+
+@pytest.mark.asyncio
+async def test_is_video_still_draft_helper():
+    from yt_autosub.uploader import _is_video_still_draft
+
+    page = MagicMock()
+    page.evaluate = AsyncMock(return_value=True)
+    assert await _is_video_still_draft(page, "https://youtu.be/S85e81BD4X4", "El escándalo de la cocaína") is True
+
+    page.evaluate = AsyncMock(return_value=False)
+    assert await _is_video_still_draft(page, "https://youtu.be/S85e81BD4X4", "El escándalo de la cocaína") is False

@@ -265,6 +265,150 @@ async def select_playlists(page: Page, account_id: str, playlists: list[str]) ->
         await done_btn.click()
         await asyncio.sleep(0.6)
 
+async def _ensure_visibility_selected(page: Page, account_id: str, visibility_value: str) -> bool:
+    """Select visibility radio inside Step 4 and verify Polymer actually marked it checked."""
+    vis_radio = page.locator(
+        f"tp-yt-paper-radio-button[name='{visibility_value}'], [name='{visibility_value}']"
+    ).first
+    for attempt in range(4):
+        await vis_radio.wait_for(state="visible", timeout=15000)
+        await vis_radio.scroll_into_view_if_needed()
+        is_checked = await vis_radio.evaluate(
+            "el => el.getAttribute('aria-checked') === 'true' || el.hasAttribute('checked')"
+        )
+        if is_checked:
+            return True
+        logger.info(f"[{account_id}] Selecting visibility '{visibility_value}' (attempt {attempt + 1}/4)...")
+        # Prefer clicking the inner radio container/label so Polymer tap handler reliably fires
+        inner_target = vis_radio.locator("#radioContainer, #radioLabel").first
+        if await inner_target.count() > 0 and await inner_target.is_visible():
+            await inner_target.click()
+        else:
+            await vis_radio.click()
+        await asyncio.sleep(0.8)
+
+    return await vis_radio.evaluate(
+        "el => el.getAttribute('aria-checked') === 'true' || el.hasAttribute('checked')"
+    )
+
+
+async def _is_video_still_draft(page: Page, video_url: Optional[str], title: str) -> bool:
+    """Check Studio Content rows to confirm the uploaded video did NOT remain a Draft."""
+    video_id = ""
+    if video_url:
+        m = re.search(r"(?:youtu\.be/|v=|/video/)([A-Za-z0-9_\-]{6,})", video_url)
+        if m:
+            video_id = m.group(1)
+
+    try:
+        return await page.evaluate(
+            """([videoId, titleText]) => {
+                const rows = Array.from(document.querySelectorAll('ytcp-video-row'));
+                for (const row of rows) {
+                    const rowText = (row.innerText || '').trim();
+                    const link = videoId ? row.querySelector(`a[href*="${videoId}"]`) : null;
+                    const titleEl = row.querySelector('#video-title, a#video-title');
+                    const rowTitle = titleEl ? titleEl.innerText.trim() : '';
+                    const matches = Boolean(link) || (titleText && rowTitle === titleText.trim());
+                    if (!matches) continue;
+
+                    const draftBtn = row.querySelector(
+                        '#edit-draft-button, ytcp-button[id*="draft" i]'
+                    ) || Array.from(row.querySelectorAll('ytcp-button, button')).find(
+                        b => /chỉnh sửa bản nháp|edit draft/i.test(b.innerText || '')
+                    );
+                    if (draftBtn) return true;
+                    if (/\\b(bản nháp|draft)\\b/i.test(rowText) && !/\\b(công khai|public|riêng tư|private|không công khai|unlisted|đã lên lịch|scheduled)\\b/i.test(rowText)) {
+                        return true;
+                    }
+                    return false;
+                }
+                return false;
+            }""",
+            [video_id, title],
+        )
+    except Exception:
+        return False
+
+
+async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[bool, Optional[str]]:
+    """
+    Click #done-button and wait for YouTube's publish RPC & confirmation dialog
+    (ytcp-video-share-dialog or ytcp-uploads-still-processing-dialog).
+    Never exits early solely because ytcp-uploads-dialog hid while the publish RPC is still in flight.
+    """
+    done_btn = page.locator("#done-button").first
+    await done_btn.wait_for(state="visible", timeout=15000)
+
+    is_enabled = False
+    for _ in range(30):
+        is_disabled = await done_btn.evaluate(
+            "el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+        )
+        if not is_disabled:
+            is_enabled = True
+            break
+        await asyncio.sleep(1)
+
+    if not is_enabled:
+        return False, "#done-button remained disabled (visibility or required checks incomplete)"
+
+    for attempt in range(3):
+        logger.info(f"[{account_id}] Clicking publish / save button (attempt {attempt + 1}/3)...")
+        await done_btn.scroll_into_view_if_needed()
+        await done_btn.click()
+
+        dialog_gone_seconds = 0
+        # Wait up to 30s for YouTube's publish RPC to finish and show share/processing confirmation
+        for _ in range(30):
+            await asyncio.sleep(1)
+
+            confirm_dialog = page.locator(
+                "ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog"
+            ).first
+            if await confirm_dialog.count() > 0 and await confirm_dialog.is_visible():
+                logger.info(f"[{account_id}] Publish confirmation dialog appeared.")
+                # Close the share/confirmation dialog cleanly so Content table updates and trailing RPCs settle
+                close_confirm = confirm_dialog.locator("#close-button, ytcp-button#close-button").first
+                if await close_confirm.count() > 0 and await close_confirm.is_visible():
+                    try:
+                        await close_confirm.click()
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+                return True, None
+
+            # Handle "Checks still running / Publish anyway" confirmation prompt if shown
+            pub_anyway = page.locator(
+                "ytcp-confirmation-dialog #confirm-button, "
+                "ytcp-button#secondary-action-button:has-text('Publish anyway'), "
+                "ytcp-button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway')"
+            ).first
+            if await pub_anyway.count() > 0 and await pub_anyway.is_visible():
+                logger.info(f"[{account_id}] Confirming 'Publish anyway' dialog...")
+                await pub_anyway.click()
+                await asyncio.sleep(2)
+                continue
+
+            upload_dialog = page.locator("ytcp-uploads-dialog").first
+            if await upload_dialog.count() == 0 or not await upload_dialog.is_visible():
+                # Do NOT exit immediately at 1s — YouTube hides ytcp-uploads-dialog for ~3-4s
+                # while the publish RPC is in flight before ytcp-video-share-dialog mounts!
+                dialog_gone_seconds += 1
+                if dialog_gone_seconds >= 8:
+                    logger.info(f"[{account_id}] Upload dialog closed and settled after {dialog_gone_seconds}s.")
+                    return True, None
+            else:
+                dialog_gone_seconds = 0
+                err_banner = upload_dialog.locator(".error-short, #error-message, ytcp-error-banner").first
+                if await err_banner.count() > 0 and await err_banner.is_visible():
+                    txt = (await err_banner.inner_text()).strip()
+                    if txt:
+                        return False, f"YouTube blocked publish: {txt}"
+
+    return False, "Video remained in draft: publish/save confirmation was not detected"
+
+
 async def upload_video(
     task: VideoUploadTask,
     headless: bool = True,
@@ -452,10 +596,7 @@ async def upload_video(
         else:
             # Instant Visibility Selection (Language-independent: name="PUBLIC", "UNLISTED", "PRIVATE")
             logger.info(f"[{account_id}] Setting visibility to {task.visibility.value}...")
-            vis_radio = page.locator(f"[name='{task.visibility.value}']").first
-            await vis_radio.wait_for(state="visible", timeout=15000)
-            await vis_radio.scroll_into_view_if_needed()
-            await vis_radio.click()
+            await _ensure_visibility_selected(page, account_id, task.visibility.value)
 
         # Capture Video Link if present
         video_url = None
@@ -491,81 +632,66 @@ async def upload_video(
                 error_message=transfer_err or "Video file upload did not complete",
             )
 
-        # Re-verify instant visibility radio is actually checked (YouTube Studio can reset
-        # Step 4 selection while uploading or if an overlay intercepted the earlier click)
+        # Re-verify instant visibility radio is actually checked (fail explicitly if not checked)
         if not task.scheduled_publish_time:
-            vis_radio = page.locator(
-                f"tp-yt-paper-radio-button[name='{task.visibility.value}'], [name='{task.visibility.value}']"
-            ).first
-            for attempt in range(3):
-                await vis_radio.wait_for(state="visible", timeout=15000)
-                await vis_radio.scroll_into_view_if_needed()
-                checked = await vis_radio.get_attribute("aria-checked")
-                if checked == "true":
-                    break
-                logger.info(f"[{account_id}] Ensuring visibility radio '{task.visibility.value}' is selected (attempt {attempt + 1})...")
-                await vis_radio.click(force=True)
-                await asyncio.sleep(0.8)
+            vis_ok = await _ensure_visibility_selected(page, account_id, task.visibility.value)
+            if not vis_ok:
+                screenshot_path = LOGS_DIR / f"upload_visibility_error_{sanitize_identifier(account_id)}.png"
+                try:
+                    await page.screenshot(path=str(screenshot_path))
+                    logger.info(f"Saved visibility-failure screenshot to {screenshot_path}")
+                except Exception:
+                    pass
+                return UploadResult(
+                    account_id=account_id,
+                    video_path=task.video_path,
+                    title=task.title,
+                    success=False,
+                    video_url=video_url,
+                    error_message=f"Could not select visibility '{task.visibility.value}' on Step 4",
+                )
 
-        await dismiss_popovers(page)
+        # Only dismiss non-confirmation bubble hints before clicking #done-button
+        try:
+            bubble_btns = page.locator("ytcp-bubble-hint button, ytcp-popover button")
+            for idx in range(min(await bubble_btns.count(), 3)):
+                btn = bubble_btns.nth(idx)
+                if await btn.is_visible():
+                    await btn.click()
+                    await asyncio.sleep(0.3)
+        except Exception:
+            pass
 
-        # Wait until #done-button is visible AND enabled before clicking
-        done_btn = page.locator("#done-button").first
-        await done_btn.wait_for(state="visible", timeout=15000)
-        for _ in range(30):
-            is_disabled = await done_btn.evaluate(
-                "el => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
-            )
-            if not is_disabled:
-                break
-            await asyncio.sleep(1)
+        # Click #done-button and wait for YouTube's publish RPC & confirmation dialog
+        published_confirmed, publish_err = await _click_publish_and_wait_confirm(page, account_id)
 
-        # Click Publish / Save Button (#done-button) and VERIFY it actually leaves Draft state
-        published_confirmed = False
-        publish_err: Optional[str] = None
-        for attempt in range(3):
-            logger.info(f"[{account_id}] Clicking publish / save button (attempt {attempt + 1}/3)...")
-            await done_btn.scroll_into_view_if_needed()
-            await done_btn.click()
-
-            # Poll up to 15s for publish confirmation dialog, secondary warning dialog, or modal close
-            for _ in range(15):
-                await asyncio.sleep(1)
-                confirm_dialog = page.locator(
-                    "ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog"
+        # Ground-truth check on Studio Content: ensure the video row is NOT still a Draft!
+        if published_confirmed and await _is_video_still_draft(page, video_url, task.title):
+            logger.warning(f"[{account_id}] Video '{task.title}' is still marked as Draft on Studio Content! Retrying draft publish once...")
+            recovered = False
+            try:
+                draft_btn = page.locator(
+                    "ytcp-video-row:has(#video-title:text-is(" + repr(task.title) + ")) "
+                    "#edit-draft-button, "
+                    "ytcp-video-row #edit-draft-button"
                 ).first
-                if await confirm_dialog.count() > 0 and await confirm_dialog.is_visible():
-                    published_confirmed = True
-                    break
-
-                # Handle "Checks still running / Publish anyway" confirmation prompt if shown
-                pub_anyway = page.locator(
-                    "ytcp-confirmation-dialog #confirm-button, "
-                    "ytcp-button#secondary-action-button:has-text('Publish anyway'), "
-                    "ytcp-button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway')"
-                ).first
-                if await pub_anyway.count() > 0 and await pub_anyway.is_visible():
-                    logger.info(f"[{account_id}] Confirming 'Publish anyway' dialog...")
-                    await pub_anyway.click()
+                if await draft_btn.count() > 0 and await draft_btn.is_visible():
+                    await draft_btn.click()
                     await asyncio.sleep(2)
-                    continue
-
-                upload_dialog = page.locator("ytcp-uploads-dialog").first
-                if await upload_dialog.count() == 0 or not await upload_dialog.is_visible():
-                    published_confirmed = True
-                    break
-
-                # Check for explicit validation/publish error banner inside dialog
-                err_banner = upload_dialog.locator(".error-short, #error-message, ytcp-error-banner").first
-                if await err_banner.count() > 0 and await err_banner.is_visible():
-                    txt = (await err_banner.inner_text()).strip()
-                    if txt:
-                        publish_err = f"YouTube blocked publish: {txt}"
-                        break
-
-            if published_confirmed or publish_err:
-                break
-            await dismiss_popovers(page)
+                    nb = page.locator("#next-button").first
+                    for _ in range(3):
+                        if await nb.count() > 0 and await nb.is_visible():
+                            await nb.click()
+                            await asyncio.sleep(1.5)
+                    if not task.scheduled_publish_time:
+                        await _ensure_visibility_selected(page, account_id, task.visibility.value)
+                    recovered, publish_err = await _click_publish_and_wait_confirm(page, account_id)
+                    if recovered and await _is_video_still_draft(page, video_url, task.title):
+                        recovered = False
+                        publish_err = "Video remained in draft even after retry"
+            except Exception as rec_err:
+                publish_err = f"Draft recovery failed: {rec_err}"
+            published_confirmed = recovered
 
         if not published_confirmed:
             screenshot_path = LOGS_DIR / f"upload_draft_error_{sanitize_identifier(account_id)}.png"
