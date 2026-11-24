@@ -128,7 +128,10 @@ async def dismiss_popovers(page: Page) -> None:
     """Dismiss any floating onboarding tooltips or guide cards without canceling dialogs."""
     try:
         # If an accidental 'Cancel upload' confirmation dialog popped up, dismiss it
-        cancel_dialog = page.locator("ytcp-confirmation-dialog, [role='dialog']:has-text('Hủy')").first
+        cancel_dialog = page.locator(
+            "[role='dialog']:has-text('Hủy tải lên'), [role='dialog']:has-text('Huỷ tải lên'), "
+            "[role='dialog']:has-text('Cancel upload')"
+        ).first
         if await cancel_dialog.count() > 0 and await cancel_dialog.is_visible():
             close_btn = cancel_dialog.locator("button:has-text('Đóng'), button:has-text('Cancel'), #secondary-action-button, button:has-text('Dismiss')").first
             if await close_btn.count() > 0 and await close_btn.is_visible():
@@ -331,6 +334,56 @@ async def _is_video_still_draft(page: Page, video_url: Optional[str], title: str
         return False
 
 
+async def _find_and_click_publish_anyway(page: Page, account_id: str) -> bool:
+    """
+    Detect YouTube Studio's 'We're still checking your content' popup and click
+    the 'Publish anyway' ('Vẫn xuất bản') action — NEVER '#confirm-button' ('Got it' / 'Đã hiểu'),
+    because '#confirm-button' aborts publishing and keeps the video as a Draft/Private.
+    """
+    # 1. Explicit text / ID match across common Studio languages
+    explicit_pub_anyway = page.locator(
+        "#publish-anyway-button, [id*='publish-anyway' i], "
+        "ytcp-button:has-text('Vẫn xuất bản'), ytcp-button:has-text('Publish anyway'), "
+        "ytcp-button:has-text('Publicar de todos modos'), ytcp-button:has-text('Publicar mesmo assim'), "
+        "ytcp-button:has-text('Publier quand même'), ytcp-button:has-text('Trotzdem veröffentlichen'), "
+        "button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway'), "
+        "button:has-text('Publicar de todos modos')"
+    ).first
+    if await explicit_pub_anyway.count() > 0 and await explicit_pub_anyway.is_visible():
+        btn_text = (await explicit_pub_anyway.inner_text()).strip()
+        logger.info(f"[{account_id}] Confirming still-checking prompt by clicking '{btn_text}'...")
+        await explicit_pub_anyway.click()
+        return True
+
+    # 2. Language-agnostic fallback: prechecks warning dialog has BOTH #secondary-action-button
+    #    (left button = Publish anyway) AND #confirm-button (right button = Got it / Abort).
+    clicked_fallback = await page.evaluate("""() => {
+        const dialogs = Array.from(document.querySelectorAll(
+            'ytcp-prechecks-warning-dialog, ytcp-confirmation-dialog, tp-yt-paper-dialog, [role="dialog"]'
+        ));
+        for (const dlg of dialogs) {
+            if (!dlg || dlg.offsetParent === null) continue;
+            const tag = (dlg.tagName || '').toLowerCase();
+            if (tag === 'ytcp-uploads-dialog' || tag === 'ytcp-video-share-dialog' || tag === 'ytcp-uploads-still-processing-dialog') {
+                continue;
+            }
+            if (dlg.closest('ytcp-uploads-dialog')) continue;
+            const sec = dlg.querySelector('#secondary-action-button');
+            const conf = dlg.querySelector('#confirm-button');
+            if (sec && conf && sec.offsetParent !== null) {
+                sec.click();
+                return (sec.innerText || 'secondary-action-button').trim();
+            }
+        }
+        return null;
+    }""")
+    if clicked_fallback:
+        logger.info(f"[{account_id}] Confirming still-checking prompt via secondary action '{clicked_fallback}'...")
+        return True
+
+    return False
+
+
 async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[bool, Optional[str]]:
     """
     Click #done-button and wait for YouTube's publish RPC & confirmation dialog
@@ -359,14 +412,26 @@ async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[
         await done_btn.click()
 
         dialog_gone_seconds = 0
-        # Wait up to 30s for YouTube's publish RPC to finish and show share/processing confirmation
-        for _ in range(30):
+        # Wait up to 35s for YouTube's publish RPC to finish and show share/processing confirmation
+        for _ in range(35):
             await asyncio.sleep(1)
+
+            # Check for "Checks still running / Publish anyway" warning BEFORE checking confirm dialogs
+            if await _find_and_click_publish_anyway(page, account_id):
+                dialog_gone_seconds = 0
+                await asyncio.sleep(2)
+                continue
 
             confirm_dialog = page.locator(
                 "ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog"
             ).first
             if await confirm_dialog.count() > 0 and await confirm_dialog.is_visible():
+                # Ensure this isn't a prechecks warning dialog containing Publish anyway
+                has_pub_anyway = await confirm_dialog.locator(
+                    "ytcp-button:has-text('Vẫn xuất bản'), ytcp-button:has-text('Publish anyway')"
+                ).count()
+                if has_pub_anyway > 0:
+                    continue
                 logger.info(f"[{account_id}] Publish confirmation dialog appeared.")
                 # Close the share/confirmation dialog cleanly so Content table updates and trailing RPCs settle
                 close_confirm = confirm_dialog.locator("#close-button, ytcp-button#close-button").first
@@ -377,18 +442,6 @@ async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[
                         pass
                 await asyncio.sleep(2)
                 return True, None
-
-            # Handle "Checks still running / Publish anyway" confirmation prompt if shown
-            pub_anyway = page.locator(
-                "ytcp-confirmation-dialog #confirm-button, "
-                "ytcp-button#secondary-action-button:has-text('Publish anyway'), "
-                "ytcp-button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway')"
-            ).first
-            if await pub_anyway.count() > 0 and await pub_anyway.is_visible():
-                logger.info(f"[{account_id}] Confirming 'Publish anyway' dialog...")
-                await pub_anyway.click()
-                await asyncio.sleep(2)
-                continue
 
             upload_dialog = page.locator("ytcp-uploads-dialog").first
             if await upload_dialog.count() == 0 or not await upload_dialog.is_visible():

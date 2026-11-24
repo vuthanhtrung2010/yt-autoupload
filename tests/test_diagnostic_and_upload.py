@@ -135,3 +135,24 @@ async def test_is_video_still_draft_helper():
 
     page.evaluate = AsyncMock(return_value=False)
     assert await _is_video_still_draft(page, "https://youtu.be/S85e81BD4X4", "El escándalo de la cocaína") is False
+
+
+@pytest.mark.asyncio
+async def test_find_and_click_publish_anyway_clicks_secondary_not_confirm():
+    from yt_autosub.uploader import _find_and_click_publish_anyway
+
+    page = MagicMock()
+    btn_mock = MagicMock()
+    btn_mock.count = AsyncMock(return_value=1)
+    btn_mock.is_visible = AsyncMock(return_value=True)
+    btn_mock.inner_text = AsyncMock(return_value="Vẫn xuất bản")
+    btn_mock.click = AsyncMock()
+
+    loc_mock = MagicMock()
+    loc_mock.first = btn_mock
+    page.locator.return_value = loc_mock
+
+    assert await _find_and_click_publish_anyway(page, "acc1") is True
+    btn_mock.click.assert_awaited_once()
+    selector_used = page.locator.call_args[0][0]
+    assert "#confirm-button" not in selector_used
