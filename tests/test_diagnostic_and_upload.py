@@ -156,3 +156,82 @@ async def test_find_and_click_publish_anyway_clicks_secondary_not_confirm():
     btn_mock.click.assert_awaited_once()
     selector_used = page.locator.call_args[0][0]
     assert "#confirm-button" not in selector_used
+
+
+@pytest.mark.asyncio
+async def test_find_and_click_publish_anyway_uses_fixed_safe_fallback():
+    from yt_autosub.uploader import _find_and_click_publish_anyway
+
+    page = MagicMock()
+    btn_mock = MagicMock()
+    btn_mock.count = AsyncMock(return_value=0)
+    loc_mock = MagicMock()
+    loc_mock.first = btn_mock
+    page.locator.return_value = loc_mock
+    page.evaluate = AsyncMock(return_value={"clicked": "Vẫn xuất bản", "mode": "secondary"})
+
+    assert await _find_and_click_publish_anyway(page, "acc1") is True
+    js_arg = page.evaluate.call_args[0][0]
+    assert "offsetParent" not in js_arg
+    assert "getBoundingClientRect" in js_arg
+
+
+@pytest.mark.asyncio
+async def test_handoff_for_verification_keeps_browser_open_and_marks_job():
+    from yt_autosub.queue_manager import UploadQueueManager
+    from yt_autosub.stream_manager import session_manager
+    from yt_autosub.models import UploadResult
+    from unittest.mock import patch
+
+    ctx = MagicMock()
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.set_viewport_size = AsyncMock()
+    page.url = "https://studio.youtube.com/channel/UC123"
+
+    sess = await session_manager.handoff_for_verification("usr_v", "acc1", ctx, page)
+    try:
+        assert sess.mode == "verify"
+        assert sess.status == "needs_verification"
+        assert sess.session_id.startswith("verify_")
+
+        # Cleanup watcher tasks without purging/failing
+        mgr = UploadQueueManager(concurrency=1)
+        mgr.start_workers()
+        try:
+            mock_res = UploadResult(
+                account_id="usr_v_acc1",
+                video_path="/tmp/v.mp4",
+                title="Verify Test",
+                success=False,
+                verification_required=True,
+                verification_session_id=sess.session_id,
+                verification_url=f"/diagnostic?session={sess.session_id}",
+                error_message="Google account verification required",
+            )
+            with patch("yt_autosub.queue_manager.VideoUploadTask") as task_cls, \
+                 patch("yt_autosub.queue_manager.upload_video", new=AsyncMock(return_value=mock_res)):
+                task_cls.return_value = MagicMock()
+                job = mgr.create_job(
+                    job_id="verify_job_1",
+                    user_id="usr_v",
+                    account_aliases=["acc1"],
+                    video_path="/tmp/v.mp4",
+                    title="Verify Test",
+                )
+                import asyncio
+                await asyncio.wait_for(mgr.queue.join(), timeout=5)
+                assert job.status == "needs_verification"
+                assert job.tasks[0].status == "needs_verification"
+                assert job.tasks[0].verification_session_id == sess.session_id
+        finally:
+            mgr._running = False
+            for w in mgr.workers:
+                w.cancel()
+    finally:
+        sess._running = False
+        if sess._stream_task:
+            sess._stream_task.cancel()
+        if sess._auth_task:
+            sess._auth_task.cancel()
+        session_manager.sessions.pop(sess.session_id, None)

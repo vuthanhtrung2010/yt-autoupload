@@ -368,6 +368,8 @@ async def list_diagnostic_sessions():
             "mode": s.mode,
             "status": s.status,
             "url": s.page.url if s.page and not s.page.is_closed() else None,
+            "embed_url": f"/diagnostic?session={s.session_id}",
+            "stream_url": f"/stream/{s.session_id}",
             "error": s.error,
         }
         for s in session_manager.sessions.values()
@@ -642,6 +644,9 @@ async def stream_view(session_id: str):
         overlay.classList.add('auth-done');
         overlay.innerHTML = '<div style="color: #2ba640; font-size: 32px; margin-bottom: 8px;">✓ Channel Connected!</div><div style="font-size: 16px; color: #aaa;">Session saved securely. You can close this window.</div>';
         badge.textContent = 'Connected';
+        badge.className = 'badge authenticated';
+      }} else if (msg.type === 'verified') {{
+        badge.textContent = 'Verified (Cookies Saved)';
         badge.className = 'badge authenticated';
       }}
     }};
@@ -997,16 +1002,21 @@ async def admin_diagnostic_page():
       if (!data.sessions || data.sessions.length === 0) {{
         sessEl.innerHTML = '<span class="muted">No active browser sessions.</span>';
       }} else {{
-        sessEl.innerHTML = data.sessions.map(s => `
-          <div class="item">
-            <div><strong>${{s.user_id}} / ${{s.account_alias}}</strong> <span class="badge ok">${{s.mode}}</span></div>
+        sessEl.innerHTML = data.sessions.map(s => {{
+          const isVerify = s.mode === 'verify' || s.status === 'needs_verification';
+          const badgeCls = isVerify ? (s.status === 'verified' ? 'ok' : 'warn') : 'ok';
+          const badgeLabel = isVerify ? `${{s.mode}} (${{s.status}})` : s.mode;
+          return `
+          <div class="item" style="${{isVerify && s.status !== 'verified' ? 'border-color:#ca8a04;' : ''}}">
+            <div><strong>${{s.user_id}} / ${{s.account_alias}}</strong> <span class="badge ${{badgeCls}}">${{badgeLabel}}</span></div>
             <div class="muted">${{s.session_id}} (${{s.status}})</div>
             <div style="display:flex; gap:6px; margin-top:6px;">
-              <button class="inline" onclick="attachSession('${{s.session_id}}', '${{s.user_id}}/${{s.account_alias}}')">Attach</button>
+              <button class="inline" onclick="attachSession('${{s.session_id}}', '${{s.user_id}}/${{s.account_alias}}')">${{isVerify ? 'Open & Verify' : 'Attach'}}</button>
               <button class="inline danger" onclick="closeSession('${{s.session_id}}')">Close</button>
             </div>
           </div>
-        `).join('');
+        `;
+        }}).join('');
       }}
     }}
 
@@ -1021,11 +1031,12 @@ async def admin_diagnostic_page():
         return;
       }}
       el.innerHTML = jobs.map(j => {{
-        const cls = j.status === 'completed' ? 'ok' : (j.status === 'failed' || j.status === 'partial_failed' ? 'err' : 'warn');
+        const cls = j.status === 'completed' ? 'ok' : (j.status === 'needs_verification' ? 'warn' : (j.status === 'failed' || j.status === 'partial_failed' ? 'err' : 'warn'));
         const tasksHtml = (j.tasks || []).map(t => `
           <div class="muted" style="margin-top:4px;">
             • ${{t.account_alias}}: <strong>${{t.status}}</strong>
             ${{t.video_url ? `<a href="${{t.video_url}}" target="_blank" style="color:#93c5fd;">${{t.video_url}}</a>` : ''}}
+            ${{t.verification_session_id ? `<div style="margin-top:4px;"><button class="inline" onclick="attachSession('${{t.verification_session_id}}', '${{j.user_id}}/${{t.account_alias}}')">Verify Browser (${{t.verification_session_id}})</button></div>` : ''}}
             ${{t.error_message ? `<div style="color:#fca5a5;">${{t.error_message}}</div>` : ''}}
           </div>
         `).join('');
@@ -1124,6 +1135,10 @@ async def admin_diagnostic_page():
             currentUrl = msg.url;
             urlBar.value = msg.url;
           }}
+        }} else if (msg.type === 'verified') {{
+          streamStatus.textContent = 'Verified (Cookies Saved)';
+          streamStatus.className = 'badge ok';
+          streamInfo.textContent = `Verification complete for ${{msg.account_alias}}! Fresh cookies saved. You can finish any pending action or close this browser.`;
         }} else if (msg.type === 'error') {{
           overlay.style.display = 'flex';
           overlay.textContent = 'Browser error: ' + msg.error;
@@ -1316,6 +1331,11 @@ async def admin_diagnostic_page():
     }}
 
     refreshAll();
+    const urlParams = new URLSearchParams(window.location.search);
+    const initialSession = urlParams.get('session');
+    if (initialSession) {{
+      attachSession(initialSession, initialSession);
+    }}
     setInterval(refreshSessionsAndUploads, 4000);
     setInterval(loadQueueJobs, 6000);
   </script>

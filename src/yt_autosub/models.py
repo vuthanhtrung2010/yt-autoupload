@@ -119,3 +119,6 @@ class UploadResult(BaseModel):
     success: bool
     video_url: Optional[str] = None
     error_message: Optional[str] = None
+    verification_required: bool = False
+    verification_session_id: Optional[str] = None
+    verification_url: Optional[str] = None

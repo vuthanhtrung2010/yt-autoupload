@@ -334,51 +334,153 @@ async def _is_video_still_draft(page: Page, video_url: Optional[str], title: str
         return False
 
 
+async def _check_identity_verification(page: Page) -> Optional[str]:
+    """
+    Detect Google's 'Verify your identity' / 'Xác minh danh tính của bạn' / re-auth prompt
+    that blocks YouTube Studio uploads with a backdrop until user interacts.
+    Returns prompt text if detected, else None.
+    """
+    if not page or page.is_closed():
+        return None
+    try:
+        return await page.evaluate("""() => {
+            const url = window.location.href || '';
+            if (/accounts\\.google\\.com|myaccount\\.google\\.com/i.test(url)) {
+                return 'Redirected to Google identity verification: ' + url;
+            }
+            const re = /xác minh danh tính|xác thực danh tính|verify your identity|verify it's you|confirm it's you|verifica tu identidad|vérifier votre identité/i;
+            const dialogs = Array.from(document.querySelectorAll('ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]'));
+            for (const d of dialogs) {
+                const st = getComputedStyle(d);
+                const r = d.getBoundingClientRect();
+                if (st.display === 'none' || st.visibility === 'hidden' || r.width === 0 || r.height === 0) continue;
+                const txt = (d.innerText || '').trim();
+                if (re.test(txt)) return txt.slice(0, 200);
+            }
+            return null;
+        }""")
+    except Exception:
+        return None
+
+
+async def _handoff_verification_result(
+    task: VideoUploadTask,
+    account_id: str,
+    context,
+    page: Page,
+    proxy: Optional[ProxyConfig],
+    prompt_text: str,
+    video_url: Optional[str] = None,
+) -> UploadResult:
+    """Keep the browser open inside session_manager so the user can complete Google verification."""
+    screenshot_path = LOGS_DIR / f"verify_required_{sanitize_identifier(account_id)}.png"
+    try:
+        await page.screenshot(path=str(screenshot_path))
+    except Exception:
+        pass
+
+    sess = await session_manager.handoff_for_verification(
+        user_id=task.user_id,
+        account_alias=task.account_alias,
+        context=context,
+        page=page,
+        proxy=proxy,
+    )
+    verify_url = f"/diagnostic?session={sess.session_id}"
+    return UploadResult(
+        account_id=account_id,
+        video_path=task.video_path,
+        title=task.title,
+        success=False,
+        video_url=video_url,
+        verification_required=True,
+        verification_session_id=sess.session_id,
+        verification_url=verify_url,
+        error_message=(
+            f"Google account verification required ({prompt_text.splitlines()[0] if prompt_text else 'Verify identity'}). "
+            f"Browser kept open — open {verify_url} (or /stream/{sess.session_id}) to verify."
+        ),
+    )
+
+
 async def _find_and_click_publish_anyway(page: Page, account_id: str) -> bool:
     """
     Detect YouTube Studio's 'We're still checking your content' popup and click
     the 'Publish anyway' ('Vẫn xuất bản') action — NEVER '#confirm-button' ('Got it' / 'Đã hiểu'),
     because '#confirm-button' aborts publishing and keeps the video as a Draft/Private.
     """
-    # 1. Explicit text / ID match across common Studio languages
+    # 1. Explicit text / ID match across common Studio languages (prefer inner <button> when nested)
     explicit_pub_anyway = page.locator(
         "#publish-anyway-button, [id*='publish-anyway' i], "
+        "button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway'), "
+        "button:has-text('Publicar de todos modos'), button:has-text('Publicar mesmo assim'), "
         "ytcp-button:has-text('Vẫn xuất bản'), ytcp-button:has-text('Publish anyway'), "
         "ytcp-button:has-text('Publicar de todos modos'), ytcp-button:has-text('Publicar mesmo assim'), "
-        "ytcp-button:has-text('Publier quand même'), ytcp-button:has-text('Trotzdem veröffentlichen'), "
-        "button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway'), "
-        "button:has-text('Publicar de todos modos')"
+        "ytcp-button:has-text('Publier quand même'), ytcp-button:has-text('Trotzdem veröffentlichen')"
     ).first
     if await explicit_pub_anyway.count() > 0 and await explicit_pub_anyway.is_visible():
         btn_text = (await explicit_pub_anyway.inner_text()).strip()
         logger.info(f"[{account_id}] Confirming still-checking prompt by clicking '{btn_text}'...")
-        await explicit_pub_anyway.click()
+        await explicit_pub_anyway.click(force=True)
         return True
 
-    # 2. Language-agnostic fallback: prechecks warning dialog has BOTH #secondary-action-button
-    #    (left button = Publish anyway) AND #confirm-button (right button = Got it / Abort).
-    clicked_fallback = await page.evaluate("""() => {
-        const dialogs = Array.from(document.querySelectorAll(
-            'ytcp-prechecks-warning-dialog, ytcp-confirmation-dialog, tp-yt-paper-dialog, [role="dialog"]'
-        ));
+    # 2. Language-agnostic + position:fixed-safe + Shadow-DOM-aware fallback:
+    #    Note: position:fixed modals always have offsetParent === null, so we check getBoundingClientRect()!
+    clicked_info = await page.evaluate("""() => {
+        function isVisibleEl(el) {
+            if (!el) return false;
+            const st = getComputedStyle(el);
+            if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        }
+        function collectAll(root, selector, out = []) {
+            if (!root) return out;
+            if (root.querySelectorAll) {
+                for (const el of root.querySelectorAll(selector)) out.push(el);
+            }
+            const walk = root.querySelectorAll ? root.querySelectorAll('*') : [];
+            for (const node of walk) {
+                if (node.shadowRoot) collectAll(node.shadowRoot, selector, out);
+            }
+            return out;
+        }
+        const dialogs = collectAll(document, 'ytcp-prechecks-warning-dialog, ytcp-confirmation-dialog, tp-yt-paper-dialog, ytcp-dialog, [role="dialog"]');
+        const pubRe = /vẫn xuất bản|publish anyway|publicar de todos modos|publicar mesmo assim|publier quand même|trotzdem veröffentlichen/i;
+
         for (const dlg of dialogs) {
-            if (!dlg || dlg.offsetParent === null) continue;
+            if (!isVisibleEl(dlg)) continue;
             const tag = (dlg.tagName || '').toLowerCase();
             if (tag === 'ytcp-uploads-dialog' || tag === 'ytcp-video-share-dialog' || tag === 'ytcp-uploads-still-processing-dialog') {
                 continue;
             }
-            if (dlg.closest('ytcp-uploads-dialog')) continue;
+            const dlgText = (dlg.innerText || '').trim();
+            // Skip if this is the main upload dialog
+            if (dlg.querySelector && dlg.querySelector('ytcp-video-upload-progress')) continue;
+
+            // Search buttons inside dialog (including shadow roots)
+            const btns = collectAll(dlg, 'ytcp-button, button, [role="button"]');
+            for (const b of btns) {
+                if (!isVisibleEl(b)) continue;
+                const txt = (b.innerText || b.getAttribute('aria-label') || '').trim();
+                if (pubRe.test(txt)) {
+                    b.click();
+                    return { clicked: txt, mode: 'text' };
+                }
+            }
+            // Fallback: secondary left button (#secondary-action-button) when #confirm-button is present
             const sec = dlg.querySelector('#secondary-action-button');
             const conf = dlg.querySelector('#confirm-button');
-            if (sec && conf && sec.offsetParent !== null) {
-                sec.click();
-                return (sec.innerText || 'secondary-action-button').trim();
+            if (sec && conf && isVisibleEl(sec)) {
+                const innerBtn = sec.querySelector('button') || sec;
+                innerBtn.click();
+                return { clicked: (sec.innerText || 'secondary-action-button').trim(), mode: 'secondary' };
             }
         }
         return null;
     }""")
-    if clicked_fallback:
-        logger.info(f"[{account_id}] Confirming still-checking prompt via secondary action '{clicked_fallback}'...")
+    if clicked_info:
+        logger.info(f"[{account_id}] Confirming still-checking prompt ({clicked_info.get('mode')}): '{clicked_info.get('clicked')}'...")
         return True
 
     return False
@@ -407,9 +509,11 @@ async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[
         return False, "#done-button remained disabled (visibility or required checks incomplete)"
 
     for attempt in range(3):
-        logger.info(f"[{account_id}] Clicking publish / save button (attempt {attempt + 1}/3)...")
-        await done_btn.scroll_into_view_if_needed()
-        await done_btn.click()
+        # Clear any still-open "Publish anyway" prompt before attempting another click on #done-button
+        if not await _find_and_click_publish_anyway(page, account_id):
+            logger.info(f"[{account_id}] Clicking publish / save button (attempt {attempt + 1}/3)...")
+            await done_btn.scroll_into_view_if_needed()
+            await done_btn.click()
 
         dialog_gone_seconds = 0
         # Wait up to 35s for YouTube's publish RPC to finish and show share/processing confirmation
@@ -479,6 +583,8 @@ async def upload_video(
     context = None
     page = None
     upload_id = None
+    handed_off_for_verification = False
+    video_url: Optional[str] = None
 
     try:
         context = await asyncio.wait_for(
@@ -562,6 +668,12 @@ async def upload_video(
         # Select Playlists if provided
         if task.playlists:
             await select_playlists(page, account_id, task.playlists)
+
+        # Check early if Google popped an identity verification modal (backdrop would block clicks)
+        verify_prompt = await _check_identity_verification(page)
+        if verify_prompt:
+            handed_off_for_verification = True
+            return await _handoff_verification_result(task, account_id, context, page, proxy, verify_prompt)
 
         # COPPA Audience Selection (Language-independent: name="VIDEO_MADE_FOR_KIDS_NOT_MFK")
         logger.info(f"[{account_id}] Selecting 'Not made for kids'...")
@@ -724,9 +836,7 @@ async def upload_video(
             recovered = False
             try:
                 draft_btn = page.locator(
-                    "ytcp-video-row:has(#video-title:text-is(" + repr(task.title) + ")) "
-                    "#edit-draft-button, "
-                    "ytcp-video-row #edit-draft-button"
+                    "ytcp-video-row:has(#video-title:text-is(" + repr(task.title) + ")) #edit-draft-button"
                 ).first
                 if await draft_btn.count() > 0 and await draft_btn.is_visible():
                     await draft_btn.click()
@@ -775,15 +885,26 @@ async def upload_video(
         )
 
     except asyncio.TimeoutError:
+        if page and context:
+            verify_prompt = await _check_identity_verification(page)
+            if verify_prompt:
+                handed_off_for_verification = True
+                return await _handoff_verification_result(task, account_id, context, page, proxy, verify_prompt, video_url=video_url)
         logger.error(f"[{account_id}] Upload timed out waiting for browser operation")
         return UploadResult(
             account_id=account_id,
             video_path=task.video_path,
             title=task.title,
             success=False,
+            video_url=video_url,
             error_message="Browser operation timed out",
         )
     except Exception as e:
+        if page and context:
+            verify_prompt = await _check_identity_verification(page)
+            if verify_prompt:
+                handed_off_for_verification = True
+                return await _handoff_verification_result(task, account_id, context, page, proxy, verify_prompt, video_url=video_url)
         logger.exception(f"[{account_id}] Failed upload: {e}")
         if page and not page.is_closed():
             screenshot_path = LOGS_DIR / f"upload_error_{sanitize_identifier(account_id)}.png"
@@ -797,10 +918,11 @@ async def upload_video(
             video_path=task.video_path,
             title=task.title,
             success=False,
+            video_url=video_url,
             error_message=str(e),
         )
     finally:
         if upload_id:
             session_manager.unregister_upload(upload_id)
-        if context:
+        if context and not handed_off_for_verification:
             await close_account_browser(context)

@@ -118,6 +118,9 @@ export interface UploadResult {
   success: boolean;
   video_url?: string | null;
   error_message?: string | null;
+  verification_required?: boolean;
+  verification_session_id?: string | null;
+  verification_url?: string | null;
 }
 
 // --- Queue Upload ---
@@ -138,15 +141,17 @@ export interface QueueUploadRequest {
 
 export interface QueueUploadResponse {
   job_id: string;
-  status: "queued" | "processing" | "completed" | "partial_failed" | "failed";
+  status: "queued" | "processing" | "completed" | "partial_failed" | "failed" | "needs_verification";
   total_channels: number;
 }
 
 export interface QueueChannelTask {
   account_alias: string;
-  status: "queued" | "uploading" | "completed" | "failed";
+  status: "queued" | "uploading" | "completed" | "failed" | "needs_verification";
   video_url?: string | null;
   error_message?: string | null;
+  verification_session_id?: string | null;
+  verification_url?: string | null;
   started_at?: string | null;
   completed_at?: string | null;
 }
@@ -154,7 +159,7 @@ export interface QueueChannelTask {
 export interface QueueJobStatus {
   job_id: string;
   user_id: string;
-  status: "queued" | "processing" | "completed" | "partial_failed" | "failed";
+  status: "queued" | "processing" | "completed" | "partial_failed" | "failed" | "needs_verification";
   title: string;
   visibility?: Visibility;
   scheduled_publish_time?: string | null;

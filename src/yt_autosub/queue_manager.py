@@ -13,9 +13,11 @@ def utc_now() -> datetime:
 @dataclass
 class QueueChannelTask:
     account_alias: str
-    status: str = "queued" # queued, uploading, completed, failed
+    status: str = "queued" # queued, uploading, completed, failed, needs_verification
     video_url: Optional[str] = None
     error_message: Optional[str] = None
+    verification_session_id: Optional[str] = None
+    verification_url: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -56,6 +58,8 @@ class QueueJob:
                     "status": t.status,
                     "video_url": t.video_url,
                     "error_message": t.error_message,
+                    "verification_session_id": t.verification_session_id,
+                    "verification_url": t.verification_url,
                     "started_at": t.started_at.isoformat() if t.started_at else None,
                     "completed_at": t.completed_at.isoformat() if t.completed_at else None,
                 }
@@ -175,6 +179,12 @@ class UploadQueueManager:
                     if result.success:
                         channel_task.status = "completed"
                         channel_task.video_url = result.video_url
+                    elif result.verification_required:
+                        channel_task.status = "needs_verification"
+                        channel_task.video_url = result.video_url
+                        channel_task.verification_session_id = result.verification_session_id
+                        channel_task.verification_url = result.verification_url
+                        channel_task.error_message = result.error_message or "Google identity verification required"
                     else:
                         channel_task.status = "failed"
                         channel_task.error_message = result.error_message or "Upload failed"
@@ -203,8 +213,10 @@ class UploadQueueManager:
         statuses = [t.status for t in job.tasks]
         if not statuses:
             job.status = "failed"
-        elif all(s in ("completed", "failed") for s in statuses):
-            if all(s == "completed" for s in statuses):
+        elif all(s in ("completed", "failed", "needs_verification") for s in statuses):
+            if any(s == "needs_verification" for s in statuses):
+                job.status = "needs_verification"
+            elif all(s == "completed" for s in statuses):
                 job.status = "completed"
             elif any(s == "completed" for s in statuses):
                 job.status = "partial_failed"

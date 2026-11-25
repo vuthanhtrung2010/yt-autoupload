@@ -141,6 +141,59 @@ class StreamingAuthSession:
 
             await asyncio.sleep(1.5)
 
+    async def attach_existing_context(self, context: BrowserContext, page: Page):
+        """Attach an already-running browser context (e.g. paused at Google 2FA/identity verification) for live user control."""
+        self.context = context
+        self.page = page
+        self.status = "needs_verification"
+        try:
+            await self.page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+        except Exception:
+            pass
+        self._stream_task = asyncio.create_task(self._frame_loop())
+        self._auth_task = asyncio.create_task(self._verify_watcher())
+
+    async def _verify_watcher(self):
+        """Watch a paused upload browser until user completes Google identity verification, then save cookies and keep open."""
+        from yt_autosub.config import resolve_account_paths
+        _, session_file, _ = resolve_account_paths(
+            user_id=self.user_id or None,
+            account_alias=self.account_alias,
+        )
+        session_file.parent.mkdir(parents=True, exist_ok=True)
+        saw_cleared = False
+
+        while self._running and self.page and not self.page.is_closed():
+            try:
+                has_verify_prompt = await self.page.evaluate("""() => {
+                    const url = window.location.href || '';
+                    if (/accounts\\.google\\.com|myaccount\\.google\\.com/i.test(url)) return true;
+                    const body = document.body ? (document.body.innerText || '') : '';
+                    return /xác minh danh tính|xác thực danh tính|verify your identity|verify it's you|confirm it's you/i.test(body);
+                }""")
+                if not has_verify_prompt and await check_is_logged_in(self.page):
+                    if not saw_cleared:
+                        saw_cleared = True
+                        await asyncio.sleep(2)
+                        await self.context.storage_state(path=str(session_file))
+                        self.is_authenticated = True
+                        self.status = "verified"
+                        self.channel_url = self.page.url
+                        logger.info(f"[{self.session_id}] Identity verification completed! Saved refreshed cookies to {session_file}")
+                        await self.broadcast({
+                            "type": "verified",
+                            "user_id": self.user_id or "default",
+                            "account_alias": self.account_alias,
+                            "channel_id": self.channel_id,
+                            "channel_url": self.channel_url,
+                        })
+                elif has_verify_prompt:
+                    saw_cleared = False
+            except Exception as e:
+                logger.debug(f"[{self.session_id}] Verify watcher poll error: {e}")
+
+            await asyncio.sleep(2)
+
     async def handle_input(self, data: dict):
         """Translate frontend mouse and keyboard events into Playwright actions."""
         if not self.page or self.page.is_closed():
@@ -391,7 +444,7 @@ class SessionManager:
         mode: str = "auth",
         target_url: Optional[str] = None,
     ) -> StreamingAuthSession:
-        prefix = "diag" if mode == "diagnostic" else "sess"
+        prefix = "diag" if mode == "diagnostic" else ("verify" if mode == "verify" else "sess")
         session_id = f"{prefix}_{uuid4().hex[:12]}"
         session = StreamingAuthSession(
             session_id=session_id,
@@ -402,6 +455,25 @@ class SessionManager:
             target_url=target_url,
         )
         self.sessions[session_id] = session
+        return session
+
+    async def handoff_for_verification(
+        self,
+        user_id: Optional[str],
+        account_alias: Optional[str],
+        context: BrowserContext,
+        page: Page,
+        proxy: Optional[ProxyConfig] = None,
+    ) -> StreamingAuthSession:
+        """Keep an upload browser open for the user to complete Google verification interactively."""
+        session = self.create_session(
+            user_id=user_id or "",
+            account_alias=account_alias or "default",
+            proxy=proxy,
+            mode="verify",
+        )
+        await session.attach_existing_context(context, page)
+        logger.info(f"[{session.session_id}] Handed off browser to user verification session (browser kept open).")
         return session
 
     def get_session(self, session_id: str) -> Optional[StreamingAuthSession]:
@@ -424,12 +496,12 @@ class SessionManager:
         return self.active_uploads.get(upload_id)
 
     async def cleanup_stale_sessions(self, max_age_seconds: int = 1800):
-        """Remove closed/finished sessions; never auto-timeout active diagnostic sessions."""
+        """Remove closed/finished sessions; never auto-timeout active diagnostic or verify sessions."""
         now = time.time()
         stale_ids = [
             sid for sid, s in self.sessions.items()
             if s.status in ("closed", "authenticated", "error")
-            or (s.mode != "diagnostic" and (now - s.created_at > max_age_seconds))
+            or (s.mode not in ("diagnostic", "verify") and (now - s.created_at > max_age_seconds))
         ]
         for sid in stale_ids:
             s = self.sessions.pop(sid, None)
