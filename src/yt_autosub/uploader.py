@@ -304,21 +304,36 @@ async def _is_video_still_draft(page: Page, video_url: Optional[str], title: str
             video_id = m.group(1)
 
     try:
+        has_rows = await page.locator("ytcp-video-row").count()
+        if has_rows == 0 or "/videos" not in page.url:
+            nav = page.locator(
+                "tp-yt-paper-icon-item#menu-item-1, a#menu-item-1, "
+                "tp-yt-paper-icon-item:has-text('Nội dung'), tp-yt-paper-icon-item:has-text('Content')"
+            ).first
+            if await nav.count() > 0 and await nav.is_visible():
+                await nav.click()
+                try:
+                    await page.locator("ytcp-video-row").first.wait_for(state="visible", timeout=6000)
+                except Exception:
+                    await asyncio.sleep(2)
+
         return await page.evaluate(
             """([videoId, titleText]) => {
+                const norm = s => (s || '').normalize('NFC').replace(/\\s+/g, ' ').trim();
+                const targetTitle = norm(titleText);
                 const rows = Array.from(document.querySelectorAll('ytcp-video-row'));
                 for (const row of rows) {
-                    const rowText = (row.innerText || '').trim();
+                    const rowText = norm(row.innerText);
                     const link = videoId ? row.querySelector(`a[href*="${videoId}"]`) : null;
                     const titleEl = row.querySelector('#video-title, a#video-title');
-                    const rowTitle = titleEl ? titleEl.innerText.trim() : '';
-                    const matches = Boolean(link) || (titleText && rowTitle === titleText.trim());
+                    const rowTitle = norm(titleEl ? titleEl.innerText : '');
+                    const matches = Boolean(link) || (targetTitle && rowTitle === targetTitle);
                     if (!matches) continue;
 
                     const draftBtn = row.querySelector(
                         '#edit-draft-button, ytcp-button[id*="draft" i]'
                     ) || Array.from(row.querySelectorAll('ytcp-button, button')).find(
-                        b => /chỉnh sửa bản nháp|edit draft/i.test(b.innerText || '')
+                        b => /chỉnh sửa bản nháp|edit draft/i.test(norm(b.innerText || b.getAttribute('aria-label')))
                     );
                     if (draftBtn) return true;
                     if (/\\b(bản nháp|draft)\\b/i.test(rowText) && !/\\b(công khai|public|riêng tư|private|không công khai|unlisted|đã lên lịch|scheduled)\\b/i.test(rowText)) {
@@ -338,6 +353,7 @@ async def _check_identity_verification(page: Page) -> Optional[str]:
     """
     Detect Google's 'Verify your identity' / 'Xác minh danh tính của bạn' / re-auth prompt
     that blocks YouTube Studio uploads with a backdrop until user interacts.
+    Searches both light DOM and open Shadow DOMs.
     Returns prompt text if detected, else None.
     """
     if not page or page.is_closed():
@@ -348,12 +364,28 @@ async def _check_identity_verification(page: Page) -> Optional[str]:
             if (/accounts\\.google\\.com|myaccount\\.google\\.com/i.test(url)) {
                 return 'Redirected to Google identity verification: ' + url;
             }
+            function isVisibleEl(el) {
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }
+            function collectAll(root, selector, out = []) {
+                if (!root) return out;
+                if (root.querySelectorAll) {
+                    for (const el of root.querySelectorAll(selector)) out.push(el);
+                }
+                const walk = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (const node of walk) {
+                    if (node.shadowRoot) collectAll(node.shadowRoot, selector, out);
+                }
+                return out;
+            }
             const re = /xác minh danh tính|xác thực danh tính|verify your identity|verify it's you|confirm it's you|verifica tu identidad|vérifier votre identité/i;
-            const dialogs = Array.from(document.querySelectorAll('ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]'));
+            const dialogs = collectAll(document, 'ytcp-dialog, tp-yt-paper-dialog, [role="dialog"]');
             for (const d of dialogs) {
-                const st = getComputedStyle(d);
-                const r = d.getBoundingClientRect();
-                if (st.display === 'none' || st.visibility === 'hidden' || r.width === 0 || r.height === 0) continue;
+                if (!isVisibleEl(d)) continue;
                 const txt = (d.innerText || '').trim();
                 if (re.test(txt)) return txt.slice(0, 200);
             }
@@ -406,27 +438,38 @@ async def _handoff_verification_result(
 async def _find_and_click_publish_anyway(page: Page, account_id: str) -> bool:
     """
     Detect YouTube Studio's 'We're still checking your content' popup and click
-    the 'Publish anyway' ('Vẫn xuất bản') action — NEVER '#confirm-button' ('Got it' / 'Đã hiểu'),
-    because '#confirm-button' aborts publishing and keeps the video as a Draft/Private.
-    """
-    # 1. Explicit text / ID match across common Studio languages (prefer inner <button> when nested)
-    explicit_pub_anyway = page.locator(
-        "#publish-anyway-button, [id*='publish-anyway' i], "
-        "button:has-text('Vẫn xuất bản'), button:has-text('Publish anyway'), "
-        "button:has-text('Publicar de todos modos'), button:has-text('Publicar mesmo assim'), "
-        "ytcp-button:has-text('Vẫn xuất bản'), ytcp-button:has-text('Publish anyway'), "
-        "ytcp-button:has-text('Publicar de todos modos'), ytcp-button:has-text('Publicar mesmo assim'), "
-        "ytcp-button:has-text('Publier quand même'), ytcp-button:has-text('Trotzdem veröffentlichen')"
-    ).first
-    if await explicit_pub_anyway.count() > 0 and await explicit_pub_anyway.is_visible():
-        btn_text = (await explicit_pub_anyway.inner_text()).strip()
-        logger.info(f"[{account_id}] Confirming still-checking prompt by clicking '{btn_text}'...")
-        await explicit_pub_anyway.click(force=True)
-        return True
+    the 'Publish anyway' ('Vẫn xuất bản') action — NEVER '#primary-action-button'
+    or '#confirm-button' ('Got it' / 'Đã hiểu'), which keeps the video as a Draft.
 
-    # 2. Language-agnostic + position:fixed-safe + Shadow-DOM-aware fallback:
-    #    Note: position:fixed modals always have offsetParent === null, so we check getBoundingClientRect()!
+    Note: YouTube Studio serves some Vietnamese UI labels in Unicode NFD
+    (e.g. 'Vẫn xuất bản'), so all text comparisons MUST normalize to NFC.
+    """
+    # 1. Known YouTube Studio prechecks warning dialog selector (#secondary-action-button)
+    #    Iterate all matches instead of .first so earlier hidden DOM elements don't mask the live dialog.
+    prechecks_btns = page.locator(
+        "ytcp-prechecks-warning-dialog #secondary-action-button button, "
+        "ytcp-prechecks-warning-dialog #secondary-action-button, "
+        "#publish-anyway-button button, #publish-anyway-button, "
+        "[id*='publish-anyway' i]"
+    )
+    cnt = await prechecks_btns.count()
+    for i in range(cnt):
+        btn = prechecks_btns.nth(i)
+        try:
+            if await btn.is_visible():
+                btn_text = (await btn.inner_text() or "").strip()
+                logger.info(f"[{account_id}] Confirming still-checking prompt by clicking '{btn_text}'...")
+                await btn.click()
+                return True
+        except Exception:
+            pass
+
+    # 2. NFC-normalized + Shadow-DOM-aware sweep across visible confirmation/warning buttons.
+    #    Note: Custom element wrappers (ytcp-prechecks-warning-dialog, ytcp-dialog) often report
+    #    rect.height === 0 because their inner tp-yt-paper-dialog is position:fixed, so visibility
+    #    must be checked on the clickable button element itself, NOT the outer wrapper.
     clicked_info = await page.evaluate("""() => {
+        const norm = s => (s || '').normalize('NFC').replace(/\\s+/g, ' ').trim();
         function isVisibleEl(el) {
             if (!el) return false;
             const st = getComputedStyle(el);
@@ -445,36 +488,37 @@ async def _find_and_click_publish_anyway(page: Page, account_id: str) -> bool:
             }
             return out;
         }
-        const dialogs = collectAll(document, 'ytcp-prechecks-warning-dialog, ytcp-confirmation-dialog, tp-yt-paper-dialog, ytcp-dialog, [role="dialog"]');
+
         const pubRe = /vẫn xuất bản|publish anyway|publicar de todos modos|publicar mesmo assim|publier quand même|trotzdem veröffentlichen/i;
+        const dialogs = collectAll(
+            document,
+            'ytcp-prechecks-warning-dialog, ytcp-confirmation-dialog, ytcp-uploads-still-processing-dialog, tp-yt-paper-dialog, [role="dialog"]'
+        );
 
         for (const dlg of dialogs) {
-            if (!isVisibleEl(dlg)) continue;
             const tag = (dlg.tagName || '').toLowerCase();
-            if (tag === 'ytcp-uploads-dialog' || tag === 'ytcp-video-share-dialog' || tag === 'ytcp-uploads-still-processing-dialog') {
-                continue;
-            }
-            const dlgText = (dlg.innerText || '').trim();
-            // Skip if this is the main upload dialog
+            if (tag === 'ytcp-uploads-dialog' || tag === 'ytcp-video-share-dialog') continue;
             if (dlg.querySelector && dlg.querySelector('ytcp-video-upload-progress')) continue;
 
-            // Search buttons inside dialog (including shadow roots)
-            const btns = collectAll(dlg, 'ytcp-button, button, [role="button"]');
+            // Search buttons inside dialog (including shadow roots) with NFC-normalized text
+            const btns = collectAll(dlg, 'button, ytcp-button, [role="button"]');
             for (const b of btns) {
                 if (!isVisibleEl(b)) continue;
-                const txt = (b.innerText || b.getAttribute('aria-label') || '').trim();
+                const txt = norm(b.innerText || b.textContent || b.getAttribute('aria-label'));
                 if (pubRe.test(txt)) {
-                    b.click();
-                    return { clicked: txt, mode: 'text' };
+                    const target = (b.tagName.toLowerCase() === 'ytcp-button' && b.querySelector('button')) || b;
+                    target.click();
+                    return { clicked: txt, mode: 'text-nfc' };
                 }
             }
-            // Fallback: secondary left button (#secondary-action-button) when #confirm-button is present
+
+            // Fallback: secondary left action alongside primary/confirm action in a visible warning dialog
             const sec = dlg.querySelector('#secondary-action-button');
-            const conf = dlg.querySelector('#confirm-button');
-            if (sec && conf && isVisibleEl(sec)) {
+            const prim = dlg.querySelector('#primary-action-button, #confirm-button');
+            if (sec && prim && isVisibleEl(sec)) {
                 const innerBtn = sec.querySelector('button') || sec;
                 innerBtn.click();
-                return { clicked: (sec.innerText || 'secondary-action-button').trim(), mode: 'secondary' };
+                return { clicked: norm(sec.innerText || 'secondary-action-button'), mode: 'secondary' };
             }
         }
         return null;
@@ -526,15 +570,29 @@ async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[
                 await asyncio.sleep(2)
                 continue
 
+            # Do not treat the flow as finished while prechecks warning dialog is still visible on screen
+            precheck_open = await page.locator("ytcp-prechecks-warning-dialog tp-yt-paper-dialog#dialog").count()
+            if precheck_open > 0:
+                try:
+                    if await page.locator("ytcp-prechecks-warning-dialog tp-yt-paper-dialog#dialog").first.is_visible():
+                        dialog_gone_seconds = 0
+                        continue
+                except Exception:
+                    pass
+
             confirm_dialog = page.locator(
                 "ytcp-video-share-dialog, ytcp-uploads-still-processing-dialog"
             ).first
             if await confirm_dialog.count() > 0 and await confirm_dialog.is_visible():
-                # Ensure this isn't a prechecks warning dialog containing Publish anyway
-                has_pub_anyway = await confirm_dialog.locator(
-                    "ytcp-button:has-text('Vẫn xuất bản'), ytcp-button:has-text('Publish anyway')"
-                ).count()
-                if has_pub_anyway > 0:
+                # Ensure this isn't a prechecks warning dialog containing Publish anyway (NFC-safe check)
+                has_pub_anyway = await confirm_dialog.evaluate(
+                    """el => {
+                        const norm = s => (s || '').normalize('NFC').trim();
+                        return /vẫn xuất bản|publish anyway|publicar de todos modos|publicar mesmo assim/i.test(norm(el.innerText));
+                    }"""
+                )
+                if has_pub_anyway:
+                    dialog_gone_seconds = 0
                     continue
                 logger.info(f"[{account_id}] Publish confirmation dialog appeared.")
                 # Close the share/confirmation dialog cleanly so Content table updates and trailing RPCs settle
@@ -547,7 +605,7 @@ async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[
                 await asyncio.sleep(2)
                 return True, None
 
-            upload_dialog = page.locator("ytcp-uploads-dialog").first
+            upload_dialog = page.locator("ytcp-uploads-dialog tp-yt-paper-dialog#dialog, ytcp-uploads-dialog").first
             if await upload_dialog.count() == 0 or not await upload_dialog.is_visible():
                 # Do NOT exit immediately at 1s — YouTube hides ytcp-uploads-dialog for ~3-4s
                 # while the publish RPC is in flight before ytcp-video-share-dialog mounts!
@@ -557,7 +615,7 @@ async def _click_publish_and_wait_confirm(page: Page, account_id: str) -> Tuple[
                     return True, None
             else:
                 dialog_gone_seconds = 0
-                err_banner = upload_dialog.locator(".error-short, #error-message, ytcp-error-banner").first
+                err_banner = page.locator("ytcp-uploads-dialog .error-short, ytcp-uploads-dialog #error-message, ytcp-uploads-dialog ytcp-error-banner").first
                 if await err_banner.count() > 0 and await err_banner.is_visible():
                     txt = (await err_banner.inner_text()).strip()
                     if txt:
@@ -637,39 +695,58 @@ async def upload_video(
         await file_input.wait_for(state="attached", timeout=20000)
         await file_input.set_input_files(task.video_path)
 
-        # Wait for details form to appear
+        # Wait for details form to appear and let initial draft title settle
         logger.info(f"[{account_id}] Waiting for metadata form...")
         title_box = page.locator("#title-textarea #textbox").first
         await title_box.wait_for(state="visible", timeout=30000)
+        await asyncio.sleep(1.5)
         await dismiss_popovers(page)
 
-        # Fill Title
+        verify_prompt = await _check_identity_verification(page)
+        if verify_prompt:
+            handed_off_for_verification = True
+            return await _handoff_verification_result(task, account_id, context, page, proxy, verify_prompt)
+
+        # Fill Title cleanly (verify it stuck and wasn't overwritten by async draft init)
         logger.info(f"[{account_id}] Setting title: {task.title}")
-        await title_box.click(force=True)
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
-        await page.keyboard.type(task.title)
+        for _attempt in range(2):
+            await title_box.click()
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(task.title)
+            await asyncio.sleep(0.4)
+            current_title = (await title_box.inner_text()).strip()
+            if task.title.strip() in current_title or current_title == task.title.strip():
+                break
 
         # Fill Description
         if task.description:
             logger.info(f"[{account_id}] Setting description...")
             desc_box = page.locator("#description-textarea #textbox").first
             if await desc_box.count() > 0:
-                await desc_box.click(force=True)
+                await desc_box.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.press("Backspace")
                 await page.keyboard.type(task.description)
 
-        # Upload Custom Thumbnail if provided
+        # Upload Custom Thumbnail if provided (wait briefly afterwards because YouTube may pop identity verification here)
         if task.thumbnail_path:
             logger.info(f"[{account_id}] Uploading thumbnail: {task.thumbnail_path}")
             thumb_input = page.locator("input#file-loader[type='file'], input[type='file'][accept*='image']").first
             if await thumb_input.count() > 0:
                 await thumb_input.set_input_files(task.thumbnail_path)
+                await asyncio.sleep(2.5)
+
+        verify_prompt = await _check_identity_verification(page)
+        if verify_prompt:
+            handed_off_for_verification = True
+            return await _handoff_verification_result(task, account_id, context, page, proxy, verify_prompt)
 
         # Select Playlists if provided
         if task.playlists:
             await select_playlists(page, account_id, task.playlists)
 
-        # Check early if Google popped an identity verification modal (backdrop would block clicks)
+        # Re-check if Google popped an identity verification modal (backdrop would block clicks)
         verify_prompt = await _check_identity_verification(page)
         if verify_prompt:
             handed_off_for_verification = True
@@ -835,23 +912,53 @@ async def upload_video(
             logger.warning(f"[{account_id}] Video '{task.title}' is still marked as Draft on Studio Content! Retrying draft publish once...")
             recovered = False
             try:
-                draft_btn = page.locator(
-                    "ytcp-video-row:has(#video-title:text-is(" + repr(task.title) + ")) #edit-draft-button"
-                ).first
-                if await draft_btn.count() > 0 and await draft_btn.is_visible():
-                    await draft_btn.click()
-                    await asyncio.sleep(2)
-                    nb = page.locator("#next-button").first
-                    for _ in range(3):
-                        if await nb.count() > 0 and await nb.is_visible():
-                            await nb.click()
-                            await asyncio.sleep(1.5)
-                    if not task.scheduled_publish_time:
-                        await _ensure_visibility_selected(page, account_id, task.visibility.value)
-                    recovered, publish_err = await _click_publish_and_wait_confirm(page, account_id)
-                    if recovered and await _is_video_still_draft(page, video_url, task.title):
-                        recovered = False
-                        publish_err = "Video remained in draft even after retry"
+                draft_vid = ""
+                if video_url:
+                    mv = re.search(r"(?:youtu\.be/|v=|/video/)([A-Za-z0-9_\-]{6,})", video_url)
+                    if mv:
+                        draft_vid = mv.group(1)
+                draft_row = (
+                    page.locator(f"ytcp-video-row:has(a[href*='{draft_vid}'])").first
+                    if draft_vid
+                    else page.locator("ytcp-video-row").filter(has_text=task.title).first
+                )
+                if await draft_row.count() > 0:
+                    await draft_row.hover()
+                    await asyncio.sleep(0.4)
+                    clicked_draft = await page.evaluate(
+                        """([videoId, titleText]) => {
+                            const norm = s => (s || '').normalize('NFC').replace(/\\s+/g, ' ').trim();
+                            const targetTitle = norm(titleText);
+                            for (const row of document.querySelectorAll('ytcp-video-row')) {
+                                const link = videoId ? row.querySelector(`a[href*="${videoId}"]`) : null;
+                                const t = norm(row.querySelector('#video-title, a#video-title')?.innerText);
+                                if (!link && !(targetTitle && t === targetTitle)) continue;
+                                const btn = row.querySelector('#edit-draft-button, ytcp-button[id*="draft" i]')
+                                    || Array.from(row.querySelectorAll('ytcp-button, button')).find(
+                                        b => /chỉnh sửa bản nháp|edit draft/i.test(norm(b.innerText || b.getAttribute('aria-label')))
+                                    );
+                                if (btn) {
+                                    (btn.querySelector('button') || btn).click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""",
+                        [draft_vid, task.title],
+                    )
+                    if clicked_draft:
+                        await asyncio.sleep(2)
+                        nb = page.locator("#next-button").first
+                        for _ in range(3):
+                            if await nb.count() > 0 and await nb.is_visible():
+                                await nb.click()
+                                await asyncio.sleep(1.5)
+                        if not task.scheduled_publish_time:
+                            await _ensure_visibility_selected(page, account_id, task.visibility.value)
+                        recovered, publish_err = await _click_publish_and_wait_confirm(page, account_id)
+                        if recovered and await _is_video_still_draft(page, video_url, task.title):
+                            recovered = False
+                            publish_err = "Video remained in draft even after retry"
             except Exception as rec_err:
                 publish_err = f"Draft recovery failed: {rec_err}"
             published_confirmed = recovered

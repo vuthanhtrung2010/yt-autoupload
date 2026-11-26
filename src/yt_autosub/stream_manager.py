@@ -80,20 +80,33 @@ class StreamingAuthSession:
             await self.broadcast({"type": "error", "error": str(e)})
             await self.close()
 
+    def _get_active_page(self) -> Optional[Page]:
+        """Return the frontmost non-closed page (handles popup verification tabs)."""
+        if self.context:
+            open_pages = [p for p in self.context.pages if not p.is_closed()]
+            if open_pages:
+                return open_pages[-1]
+        if self.page and not self.page.is_closed():
+            return self.page
+        return None
+
     async def _frame_loop(self):
-        """Continuously capture frames and broadcast them over WebSockets."""
+        """Continuously capture frames from the active page and broadcast them over WebSockets."""
         frame_interval = 0.1  # ~10 fps base, with instant frames on action
-        while self._running and self.page and not self.page.is_closed():
+        while self._running:
+            active_page = self._get_active_page()
+            if not active_page:
+                break
             try:
                 # Capture JPEG frame with moderate compression for low latency
-                screenshot_bytes = await self.page.screenshot(type="jpeg", quality=65)
+                screenshot_bytes = await active_page.screenshot(type="jpeg", quality=65)
                 b64_img = base64.b64encode(screenshot_bytes).decode("ascii")
 
                 msg = {
                     "type": "frame",
                     "data": f"data:image/jpeg;base64,{b64_img}",
                     "status": self.status,
-                    "url": self.page.url,
+                    "url": active_page.url,
                 }
                 await self.broadcast(msg)
 
@@ -163,22 +176,33 @@ class StreamingAuthSession:
         session_file.parent.mkdir(parents=True, exist_ok=True)
         saw_cleared = False
 
-        while self._running and self.page and not self.page.is_closed():
+        while self._running:
+            active_page = self._get_active_page()
+            if not active_page:
+                break
             try:
-                has_verify_prompt = await self.page.evaluate("""() => {
-                    const url = window.location.href || '';
-                    if (/accounts\\.google\\.com|myaccount\\.google\\.com/i.test(url)) return true;
-                    const body = document.body ? (document.body.innerText || '') : '';
-                    return /xác minh danh tính|xác thực danh tính|verify your identity|verify it's you|confirm it's you/i.test(body);
-                }""")
-                if not has_verify_prompt and await check_is_logged_in(self.page):
+                has_verify_prompt = False
+                open_pages = [p for p in (self.context.pages if self.context else [active_page]) if not p.is_closed()]
+                for p in open_pages:
+                    p_has_prompt = await p.evaluate("""() => {
+                        const url = window.location.href || '';
+                        if (/accounts\\.google\\.com|myaccount\\.google\\.com/i.test(url)) return true;
+                        const body = document.body ? (document.body.innerText || '') : '';
+                        return /xác minh danh tính|xác thực danh tính|verify your identity|verify it's you|confirm it's you/i.test(body);
+                    }""")
+                    if p_has_prompt:
+                        has_verify_prompt = True
+                        break
+
+                studio_page = self.page if (self.page and not self.page.is_closed()) else active_page
+                if not has_verify_prompt and await check_is_logged_in(studio_page):
                     if not saw_cleared:
                         saw_cleared = True
                         await asyncio.sleep(2)
                         await self.context.storage_state(path=str(session_file))
                         self.is_authenticated = True
                         self.status = "verified"
-                        self.channel_url = self.page.url
+                        self.channel_url = studio_page.url
                         logger.info(f"[{self.session_id}] Identity verification completed! Saved refreshed cookies to {session_file}")
                         await self.broadcast({
                             "type": "verified",
@@ -195,8 +219,9 @@ class StreamingAuthSession:
             await asyncio.sleep(2)
 
     async def handle_input(self, data: dict):
-        """Translate frontend mouse and keyboard events into Playwright actions."""
-        if not self.page or self.page.is_closed():
+        """Translate frontend mouse and keyboard events into Playwright actions on the active page."""
+        active_page = self._get_active_page()
+        if not active_page:
             return
 
         msg_type = data.get("type")
@@ -213,49 +238,49 @@ class StreamingAuthSession:
                 actual_y = max(0, min(VIEWPORT_HEIGHT, norm_y * VIEWPORT_HEIGHT))
 
                 if action == "click":
-                    await self.page.mouse.click(actual_x, actual_y, button=btn)
+                    await active_page.mouse.click(actual_x, actual_y, button=btn)
                 elif action == "move":
-                    await self.page.mouse.move(actual_x, actual_y)
+                    await active_page.mouse.move(actual_x, actual_y)
                 elif action == "down":
-                    await self.page.mouse.down(button=btn)
+                    await active_page.mouse.down(button=btn)
                 elif action == "up":
-                    await self.page.mouse.up(button=btn)
+                    await active_page.mouse.up(button=btn)
 
             elif msg_type == "keyboard":
                 action = data.get("action", "type")
                 if action == "type":
                     text = data.get("text", "")
-                    await self.page.keyboard.type(text)
+                    await active_page.keyboard.type(text)
                 elif action == "press":
                     key = data.get("key", "")
-                    await self.page.keyboard.press(key)
+                    await active_page.keyboard.press(key)
                 elif action == "down":
                     key = data.get("key", "")
-                    await self.page.keyboard.down(key)
+                    await active_page.keyboard.down(key)
                 elif action == "up":
                     key = data.get("key", "")
-                    await self.page.keyboard.up(key)
+                    await active_page.keyboard.up(key)
 
             elif msg_type == "scroll":
                 dx = float(data.get("deltaX", 0))
                 dy = float(data.get("deltaY", 0))
-                await self.page.mouse.wheel(dx, dy)
+                await active_page.mouse.wheel(dx, dy)
 
             elif msg_type == "navigate":
                 url = str(data.get("url", "")).strip()
                 if url:
                     if not url.startswith(("http://", "https://")):
                         url = "https://" + url
-                    await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await active_page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             elif msg_type == "reload":
-                await self.page.reload(wait_until="domcontentloaded", timeout=30000)
+                await active_page.reload(wait_until="domcontentloaded", timeout=30000)
 
             elif msg_type == "back":
-                await self.page.go_back(wait_until="domcontentloaded", timeout=30000)
+                await active_page.go_back(wait_until="domcontentloaded", timeout=30000)
 
             elif msg_type == "forward":
-                await self.page.go_forward(wait_until="domcontentloaded", timeout=30000)
+                await active_page.go_forward(wait_until="domcontentloaded", timeout=30000)
 
             # Trigger immediate frame capture
             self._action_event.set()
